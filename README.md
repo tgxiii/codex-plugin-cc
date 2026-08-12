@@ -285,6 +285,16 @@ Your configuration will be picked up based on:
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
 
+The plugin also supports these timeout environment variables. All values use milliseconds.
+
+- `CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS` controls idle turns with no active item. The default is 600000.
+- `CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS` controls idle turns with an active item. The default is 3600000.
+- `CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS` controls the interrupt request deadline. The default is 5000.
+- `CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS` controls the terminal-event grace period after interrupt. The default is 5000.
+- `CODEX_COMPANION_BROKER_STREAM_LEASE_MS` controls the broker stream lease. The default is 3900000.
+
+The broker raises its lease when needed. The effective lease always exceeds the largest turn watchdog window by one minute.
+
 ### Moving The Work Over To Codex
 
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.

@@ -281,7 +281,9 @@ export function resolveResultJob(cwd, reference) {
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
+  const activeJobs = jobs.filter(
+    (job) => job.status === "queued" || job.status === "running" || (job.status === "failed" && job.phase === "timed_out")
+  );
 
   if (reference) {
     const selected = matchJobReference(activeJobs, reference);

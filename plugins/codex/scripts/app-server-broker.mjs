@@ -6,15 +6,24 @@ import path from "node:path";
 import process from "node:process";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import { BROKER_BUSY_RPC_CODE, CodexAppServerClient, resolveTurnWatchdogConfig, timeoutFromEnv } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 const DEFAULT_STREAM_LEASE_MS = 65 * 60 * 1000;
+const STREAM_LEASE_MARGIN_MS = 60 * 1000;
 
-function streamLeaseMs() {
-  const configured = Number.parseInt(process.env.CODEX_COMPANION_BROKER_STREAM_LEASE_MS ?? "", 10);
-  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_STREAM_LEASE_MS;
+function resolveStreamLeaseMs() {
+  const configured = timeoutFromEnv(process.env, "CODEX_COMPANION_BROKER_STREAM_LEASE_MS", DEFAULT_STREAM_LEASE_MS);
+  const watchdog = resolveTurnWatchdogConfig(process.env);
+  const floor = Math.max(watchdog.idleTimeoutMs, watchdog.activeItemTimeoutMs) + STREAM_LEASE_MARGIN_MS;
+  if (configured < floor) {
+    process.stderr.write(
+      `Configured broker stream lease ${configured}ms is below the watchdog safety floor ${floor}ms. Using ${floor}ms.\n`
+    );
+    return floor;
+  }
+  return configured;
 }
 
 function buildStreamThreadIds(method, params, result) {
@@ -69,6 +78,7 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const leaseDurationMs = resolveStreamLeaseMs();
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -78,6 +88,7 @@ async function main() {
   let activeStreamLease = null;
   let runtimeAlive = true;
   let shuttingDown = false;
+  const orphanThreadIds = new Set();
   const sockets = new Set();
 
   function clearActiveStream() {
@@ -96,7 +107,7 @@ async function main() {
     if (activeStreamLease.timer) {
       clearTimeout(activeStreamLease.timer);
     }
-    const durationMs = streamLeaseMs();
+    const durationMs = leaseDurationMs;
     activeStreamLease.expiresAt = Date.now() + durationMs;
     const lease = activeStreamLease;
     lease.timer = setTimeout(() => {
@@ -128,6 +139,13 @@ async function main() {
   }
 
   function routeNotification(message) {
+    const threadId = message.params?.threadId ?? null;
+    if (threadId && orphanThreadIds.has(threadId)) {
+      if (message.method === "turn/completed" || message.method === "error") {
+        orphanThreadIds.delete(threadId);
+      }
+      return;
+    }
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
@@ -135,7 +153,6 @@ async function main() {
     send(target, message);
     refreshActiveStreamLease();
     if (message.method === "turn/completed" && activeStreamSocket === target) {
-      const threadId = message.params?.threadId ?? null;
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
         clearActiveStream();
         if (activeRequestSocket === target) {
@@ -224,6 +241,16 @@ async function main() {
           send(socket, { id: message.id, result: {} });
           await shutdown(server);
           process.exit(0);
+        }
+
+        if (message.id !== undefined && message.method === "broker/orphan-threads") {
+          for (const threadId of message.params?.threadIds ?? []) {
+            if (typeof threadId === "string" && threadId) {
+              orphanThreadIds.add(threadId);
+            }
+          }
+          send(socket, { id: message.id, result: {} });
+          continue;
         }
 
         if (message.id === undefined) {

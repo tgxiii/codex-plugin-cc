@@ -434,6 +434,10 @@ export function renderStoredJobResult(job, storedJob) {
     lines.push(`Summary: ${job.summary}`);
   }
 
+  if (storedJob?.capturedOutput) {
+    lines.push("", "Captured output:", storedJob.capturedOutput);
+  }
+
   if (job.errorMessage) {
     lines.push("", job.errorMessage);
   } else if (storedJob?.errorMessage) {

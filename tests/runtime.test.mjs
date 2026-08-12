@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { buildTurnTimeoutMessage } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { loadBrokerSession, saveBrokerSession, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -1013,7 +1014,7 @@ test("task times out when turn/completed and the final answer are missing after 
   assert.equal(result.status > 0, true);
   assert.match(
     result.stderr,
-    /Codex turn timed out after 10 minutes without app-server events\. The underlying work may have completed\. Inspect the worktree and rollout\./
+    new RegExp(buildTurnTimeoutMessage(50, true).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
   );
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
   assert.deepEqual(fakeState.backendTaskComplete, {
@@ -1045,7 +1046,7 @@ test("task does not apply the idle timeout while a command item remains active",
     ...buildEnv(binDir),
     CLAUDE_PLUGIN_DATA: "",
     CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "40",
-    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "1000"
+    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "80"
   };
   const result = run("node", [SCRIPT, "task", "run the long command"], { cwd: repo, env });
 
@@ -1055,6 +1056,125 @@ test("task does not apply the idle timeout while a command item remains active",
   run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
     env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("error notifications drain active items and restore the short idle window", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "active-item-error");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "2000",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "25"
+  };
+  const result = run("node", [SCRIPT, "task", "observe the failed active item"], { cwd: repo, env });
+
+  assert.equal(result.status > 0, true);
+  assert.match(result.stderr, new RegExp(buildTurnTimeoutMessage(50, true).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("turn/start can acknowledge after 30 seconds when pre-ack events remain healthy", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-turn-start-ack");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    FAKE_CODEX_TURN_START_ACK_DELAY_MS: "30100",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "200"
+  };
+  const result = run("node", [SCRIPT, "task", "wait for the healthy delayed acknowledgment"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("unacknowledged timeout quarantines orphan notifications and remains cancellable", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "orphan-contamination");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS: "25",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "25"
+  };
+  const first = run("node", [SCRIPT, "task", "start the orphan-prone turn"], { cwd: repo, env });
+  assert.equal(first.status > 0, true);
+  assert.match(first.stderr, /underlying turn may still be running; the working tree may still be written to/i);
+
+  const stateDir = resolveStateDirForEnv(repo, env);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const timedOutJob = state.jobs.find((job) => job.phase === "timed_out");
+  assert.ok(timedOutJob);
+  const timedOutStored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${timedOutJob.id}.json`), "utf8"));
+  assert.equal(timedOutStored.interruptAcknowledged, false);
+  assert.equal(timedOutStored.timeoutWindowMs, 50);
+  assert.deepEqual(timedOutStored.orphanThreadIds, [timedOutStored.threadId]);
+
+  const result = run("node", [SCRIPT, "result", timedOutJob.id], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Captured output:/);
+  assert.match(result.stdout, /Partial output before the downstream stream stalled\./);
+
+  const interruptsBeforeCancel = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).interrupts.length;
+  const cancel = run("node", [SCRIPT, "cancel", timedOutJob.id, "--json"], { cwd: repo, env });
+  assert.equal(cancel.status, 0, cancel.stderr);
+  assert.equal(JSON.parse(cancel.stdout).turnInterruptAttempted, true);
+  const afterCancelFakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(afterCancelFakeState.interrupts.length, interruptsBeforeCancel + 1);
+  assert.deepEqual(afterCancelFakeState.interrupts.at(-1), {
+    threadId: timedOutStored.threadId,
+    turnId: timedOutStored.turnId
+  });
+
+  const resumedEnv = { ...env, CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "2000" };
+  const second = run("node", [SCRIPT, "task", "--resume", "finish without orphan output"], { cwd: repo, env: resumedEnv });
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stdout, /Handled the requested task/);
+
+  const finalState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const completedJob = finalState.jobs.find((job) => job.status === "completed");
+  assert.ok(completedJob);
+  const completedStored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${completedJob.id}.json`), "utf8"));
+  assert.deepEqual(completedStored.result.touchedFiles, []);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: resumedEnv,
     input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
   });
 });
@@ -1208,8 +1328,12 @@ test("background timeout records timed_out and releases the broker stream owner"
   assert.ok(timedOutJob.turnId);
   assert.equal(
     timedOutJob.errorMessage,
-    "Codex turn timed out after 10 minutes without app-server events. The underlying work may have completed. Inspect the worktree and rollout."
+    buildTurnTimeoutMessage(50, true)
   );
+  assert.equal(timedOutJob.interruptAcknowledged, true);
+  assert.equal(timedOutJob.timeoutWindowMs, 50);
+  const brokerSession = JSON.parse(fs.readFileSync(path.join(stateDir, "broker.json"), "utf8"));
+  assert.match(fs.readFileSync(brokerSession.logFile, "utf8"), /watchdog safety floor/);
 
   const setup = run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env });
   assert.equal(setup.status, 0, setup.stderr);

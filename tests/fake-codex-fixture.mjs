@@ -452,6 +452,34 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
+	        const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
+	          ? structuredReviewPayload(prompt)
+	          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+
+	        if (BEHAVIOR === "slow-turn-start-ack") {
+	          const delayMs = Number(process.env.FAKE_CODEX_TURN_START_ACK_DELAY_MS || 100);
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          let heartbeat = 0;
+	          const heartbeatTimer = setInterval(() => {
+	            heartbeat += 1;
+	            send({
+	              method: "item/completed",
+	              params: {
+	                threadId: thread.id,
+	                turnId,
+	                item: { type: "reasoning", id: "heartbeat_" + turnId + "_" + heartbeat, summary: [{ text: "Still working before turn/start acknowledgment." }], content: [] }
+	              }
+	            });
+	          }, 50);
+	          setTimeout(() => {
+	            clearInterval(heartbeatTimer);
+	            send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" } } });
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, delayMs);
+	          break;
+	        }
+
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
 	        if (BEHAVIOR === "missing-turn-terminal") {
@@ -469,9 +497,20 @@ rl.on("line", (line) => {
 	          break;
 	        }
 
-        const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
-          ? structuredReviewPayload(prompt)
-          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+	        if (BEHAVIOR === "active-item-error") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "item/started", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: "stuck_" + turnId, command: "stuck command", status: "inProgress" } } });
+	          send({ method: "error", params: { threadId: thread.id, turnId, error: { message: "The active item failed without a terminal event." } } });
+	          break;
+	        }
+
+	        if (BEHAVIOR === "orphan-contamination" && !state.orphanTurnId) {
+	          state.orphanTurnId = turnId;
+	          saveState(state);
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "partial_" + turnId, text: "Partial output before the downstream stream stalled.", phase: "analysis" } } });
+	          break;
+	        }
 
         if (
           BEHAVIOR === "with-subagent" ||
@@ -611,7 +650,13 @@ rl.on("line", (line) => {
 	              item: { type: "commandExecution", id: commandId, command: "sleep 0.15", status: "inProgress" }
 	            }
 	          });
+	          let heartbeat = 0;
+	          const heartbeatTimer = setInterval(() => {
+	            heartbeat += 1;
+	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "reasoning", id: "active_heartbeat_" + heartbeat, summary: [{ text: "The active command is still producing progress." }], content: [] } } });
+	          }, 25);
 	          setTimeout(() => {
+	            clearInterval(heartbeatTimer);
 	            send({
 	              method: "item/completed",
 	              params: {
@@ -624,7 +669,15 @@ rl.on("line", (line) => {
 	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
 	            }
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
-	          }, 150);
+	          }, 250);
+	        } else if (BEHAVIOR === "orphan-contamination") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          setTimeout(() => {
+	            for (const entry of items) {
+	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
+	            }
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, 1200);
 	        } else if (BEHAVIOR === "interruptible-slow-task") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
@@ -649,11 +702,34 @@ rl.on("line", (line) => {
 	      }
 
 	      case "turn/interrupt": {
+	        state.interrupts = [...(state.interrupts || []), {
+	          threadId: message.params.threadId,
+	          turnId: message.params.turnId
+	        }];
 	        state.lastInterrupt = {
 	          threadId: message.params.threadId,
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "orphan-contamination" && message.params.turnId === state.orphanTurnId) {
+	          if (!state.orphanLateScheduled) {
+	            state.orphanLateScheduled = true;
+	            saveState(state);
+	            setTimeout(() => {
+	              send({
+	                method: "item/completed",
+	                params: {
+	                  threadId: message.params.threadId,
+	                  item: { type: "fileChange", id: "orphan_file_change", status: "completed", changes: [{ path: "orphan.txt", kind: "add" }] }
+	                }
+	              });
+	            }, 800);
+	            setTimeout(() => {
+	              send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: buildTurn(message.params.turnId, "completed") } });
+	            }, 850);
+	          }
+	          break;
+	        }
 	        const pending = interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);

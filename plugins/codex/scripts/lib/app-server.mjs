@@ -21,12 +21,49 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+export const TURN_IDLE_TIMEOUT_CODE = "TURN_IDLE_TIMEOUT";
+export const DEFAULT_TURN_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+export const DEFAULT_TURN_ACTIVE_TIMEOUT_MS = 60 * 60 * 1000;
+export const DEFAULT_TURN_INTERRUPT_DEADLINE_MS = 5_000;
+export const DEFAULT_TURN_INTERRUPT_GRACE_MS = 5_000;
 
 const CLOSE_TIMEOUT_MS = 5_000;
 const REQUEST_DEADLINE_MS = new Map([
-  ["turn/start", 30_000],
-  ["turn/interrupt", 5_000]
+  ["turn/interrupt", DEFAULT_TURN_INTERRUPT_DEADLINE_MS]
 ]);
+
+export function timeoutFromEnv(env, name, fallback) {
+  const value = Number.parseInt(env?.[name] ?? "", 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+export function resolveTurnWatchdogConfig(env = process.env) {
+  return {
+    idleTimeoutMs: timeoutFromEnv(env, "CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS", DEFAULT_TURN_IDLE_TIMEOUT_MS),
+    activeItemTimeoutMs: timeoutFromEnv(env, "CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS", DEFAULT_TURN_ACTIVE_TIMEOUT_MS),
+    interruptDeadlineMs: timeoutFromEnv(env, "CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS", DEFAULT_TURN_INTERRUPT_DEADLINE_MS),
+    interruptGraceMs: timeoutFromEnv(env, "CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS", DEFAULT_TURN_INTERRUPT_GRACE_MS)
+  };
+}
+
+function formatTimeoutWindow(timeoutMs) {
+  if (timeoutMs % 60_000 === 0) {
+    const minutes = timeoutMs / 60_000;
+    return `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
+  }
+  if (timeoutMs % 1_000 === 0) {
+    const seconds = timeoutMs / 1_000;
+    return `${seconds} ${seconds === 1 ? "second" : "seconds"}`;
+  }
+  return `${timeoutMs} milliseconds`;
+}
+
+export function buildTurnTimeoutMessage(timeoutMs, interruptAcknowledged) {
+  const outcome = interruptAcknowledged
+    ? "The underlying work may have completed. Inspect the worktree and rollout."
+    : "The underlying turn may still be running; the working tree may still be written to. Retry /codex:cancel before continuing.";
+  return `Codex turn timed out after ${formatTimeoutWindow(timeoutMs)} without app-server events. ${outcome}`;
+}
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -102,7 +139,12 @@ class AppServerClientBase {
     this.nextId += 1;
 
     return new Promise((resolve, reject) => {
-      const deadlineMs = options.deadlineMs ?? REQUEST_DEADLINE_MS.get(method) ?? null;
+      const defaultDeadlineMs = REQUEST_DEADLINE_MS.get(method) ?? null;
+      const deadlineMs = options.deadlineMs ?? (
+        method === "turn/interrupt"
+          ? timeoutFromEnv(this.options.env ?? process.env, "CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS", defaultDeadlineMs)
+          : defaultDeadlineMs
+      );
       const deadlineTimer = deadlineMs
         ? setTimeout(() => {
             this.pending.delete(id);
