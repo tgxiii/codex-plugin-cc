@@ -47,6 +47,9 @@ export function resolveTurnWatchdogConfig(env = process.env) {
 }
 
 function formatTimeoutWindow(timeoutMs) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return "the configured window";
+  }
   if (timeoutMs % 60_000 === 0) {
     const minutes = timeoutMs / 60_000;
     return `${minutes} ${minutes === 1 ? "minute" : "minutes"}`;
@@ -58,10 +61,12 @@ function formatTimeoutWindow(timeoutMs) {
   return `${timeoutMs} milliseconds`;
 }
 
-export function buildTurnTimeoutMessage(timeoutMs, interruptAcknowledged) {
-  const outcome = interruptAcknowledged
-    ? "The underlying work may have completed. Inspect the worktree and rollout."
-    : "The underlying turn may still be running; the working tree may still be written to. Retry /codex:cancel before continuing.";
+export function buildTurnTimeoutMessage(timeoutMs, interruptAcknowledged, turnAcknowledged = true) {
+  const outcome = !turnAcknowledged
+    ? "The turn did not acknowledge, so /codex:cancel cannot reach it. Inspect the worktree and rollout."
+    : interruptAcknowledged
+      ? "The underlying work may have completed. Inspect the worktree and rollout."
+      : "The underlying turn may still be running; the working tree may still be written to. Retry /codex:cancel before continuing.";
   return `Codex turn timed out after ${formatTimeoutWindow(timeoutMs)} without app-server events. ${outcome}`;
 }
 

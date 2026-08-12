@@ -6,7 +6,7 @@
  * @typedef {import("./app-server-protocol").ThreadStartParams} ThreadStartParams
  * @typedef {import("./app-server-protocol").Turn} Turn
  * @typedef {import("./app-server-protocol").UserInput} UserInput
- * @typedef {Error & { code: string, threadId: string, threadIds: string[], turnId: string | null, capturedOutput: string, notificationTimestamps: Record<string, number>, interruptAcknowledged: boolean, timeoutWindowMs: number }} TurnTimeoutError
+ * @typedef {Error & { code: string, threadId: string, threadIds: string[], turnId: string | null, capturedOutput: string, notificationTimestamps: Record<string, number>, interruptAcknowledged: boolean, turnAcknowledged: boolean, timeoutWindowMs: number }} TurnTimeoutError
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
  * @typedef {{
  *   threadId: string,
@@ -76,6 +76,10 @@ const RELEVANT_TURN_NOTIFICATION_METHODS = new Set([
   "turn/started",
   "item/started",
   "item/completed",
+  "item/commandExecution/outputDelta",
+  "item/mcpToolCall/progress",
+  "turn/diff/updated",
+  "turn/plan/updated",
   "error",
   "turn/completed"
 ]);
@@ -138,7 +142,7 @@ function buildTaskThreadName(prompt) {
 }
 
 function extractThreadId(message) {
-  return message?.params?.threadId ?? null;
+  return message?.params?.threadId ?? message?.params?.thread?.id ?? null;
 }
 
 function extractTurnId(message) {
@@ -506,8 +510,9 @@ function noteTurnNotification(state, message, onExpiry) {
 }
 
 function createTurnTimeoutError(state, timeoutWindowMs, interruptAcknowledged) {
+  const turnAcknowledged = Boolean(state.turnId);
   const error = /** @type {TurnTimeoutError} */ (
-    new Error(buildTurnTimeoutMessage(timeoutWindowMs, interruptAcknowledged))
+    new Error(buildTurnTimeoutMessage(timeoutWindowMs, interruptAcknowledged, turnAcknowledged))
   );
   error.code = TURN_IDLE_TIMEOUT_CODE;
   error.threadId = state.threadId;
@@ -516,6 +521,7 @@ function createTurnTimeoutError(state, timeoutWindowMs, interruptAcknowledged) {
   error.capturedOutput = state.lastAgentMessage || state.reviewText || "";
   error.notificationTimestamps = Object.fromEntries(state.notificationTimestamps);
   error.interruptAcknowledged = interruptAcknowledged;
+  error.turnAcknowledged = turnAcknowledged;
   error.timeoutWindowMs = timeoutWindowMs;
   return error;
 }
@@ -555,9 +561,12 @@ async function expireTurnCapture(client, state, expiredDeadline, timeoutWindowMs
     return;
   }
 
-  if (!interruptAcknowledged && client.transport === "broker") {
+  if (!interruptAcknowledged && state.turnId && client.transport === "broker") {
     try {
-      await client.request("broker/orphan-threads", { threadIds: [...state.threadIds] }, { deadlineMs: state.interruptDeadlineMs });
+      const turns = [...state.threadIds]
+        .map((threadId) => ({ threadId, turnId: state.threadTurnIds.get(threadId) ?? state.turnId }))
+        .filter((entry) => entry.turnId);
+      await client.request("broker/orphan-threads", { turns }, { deadlineMs: state.interruptDeadlineMs });
     } catch {
       // Closing this client still releases its stream ownership.
     }
@@ -730,7 +739,9 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
-      noteTurnNotification(state, message, onWatchdogExpiry);
+      if (extractThreadId(message) === state.threadId || message.method === "thread/started") {
+        noteTurnNotification(state, message, onWatchdogExpiry);
+      }
       return;
     }
 

@@ -1115,6 +1115,40 @@ test("turn/start can acknowledge after 30 seconds when pre-ack events remain hea
   });
 });
 
+test("foreign pre-ack traffic does not refresh a hung turn/start watchdog", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "hung-turn-start-foreign-traffic");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS: "25",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "25"
+  };
+  const result = run("node", [SCRIPT, "task", "ignore foreign pre-ack traffic"], { cwd: repo, env });
+
+  assert.equal(result.status > 0, true);
+  assert.match(result.stderr, /turn did not acknowledge/i);
+  assert.match(result.stderr, /\/codex:cancel cannot reach it/i);
+  const stateDir = resolveStateDirForEnv(repo, env);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const timedOutJob = state.jobs.find((job) => job.phase === "timed_out");
+  assert.equal(timedOutJob.turnAcknowledged, false);
+  assert.equal(timedOutJob.orphanThreadIds, undefined);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
 test("unacknowledged timeout quarantines orphan notifications and remains cancellable", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1143,23 +1177,12 @@ test("unacknowledged timeout quarantines orphan notifications and remains cancel
   const timedOutStored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${timedOutJob.id}.json`), "utf8"));
   assert.equal(timedOutStored.interruptAcknowledged, false);
   assert.equal(timedOutStored.timeoutWindowMs, 50);
-  assert.deepEqual(timedOutStored.orphanThreadIds, [timedOutStored.threadId]);
+  assert.ok(timedOutStored.orphanThreadIds.includes(timedOutStored.threadId));
 
   const result = run("node", [SCRIPT, "result", timedOutJob.id], { cwd: repo, env });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Captured output:/);
   assert.match(result.stdout, /Partial output before the downstream stream stalled\./);
-
-  const interruptsBeforeCancel = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).interrupts.length;
-  const cancel = run("node", [SCRIPT, "cancel", timedOutJob.id, "--json"], { cwd: repo, env });
-  assert.equal(cancel.status, 0, cancel.stderr);
-  assert.equal(JSON.parse(cancel.stdout).turnInterruptAttempted, true);
-  const afterCancelFakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
-  assert.equal(afterCancelFakeState.interrupts.length, interruptsBeforeCancel + 1);
-  assert.deepEqual(afterCancelFakeState.interrupts.at(-1), {
-    threadId: timedOutStored.threadId,
-    turnId: timedOutStored.turnId
-  });
 
   const resumedEnv = { ...env, CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "2000" };
   const second = run("node", [SCRIPT, "task", "--resume", "finish without orphan output"], { cwd: repo, env: resumedEnv });
@@ -1171,6 +1194,21 @@ test("unacknowledged timeout quarantines orphan notifications and remains cancel
   assert.ok(completedJob);
   const completedStored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${completedJob.id}.json`), "utf8"));
   assert.deepEqual(completedStored.result.touchedFiles, []);
+
+  const bareCancel = run("node", [SCRIPT, "cancel", "--json"], { cwd: repo, env });
+  assert.equal(bareCancel.status > 0, true);
+  assert.match(bareCancel.stderr, /No active Codex jobs to cancel/);
+
+  const interruptsBeforeCancel = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).interrupts.length;
+  const cancel = run("node", [SCRIPT, "cancel", timedOutJob.id, "--json"], { cwd: repo, env });
+  assert.equal(cancel.status, 0, cancel.stderr);
+  assert.equal(JSON.parse(cancel.stdout).turnInterruptAttempted, true);
+  const afterCancelFakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(afterCancelFakeState.interrupts.length, interruptsBeforeCancel + 1);
+  assert.deepEqual(afterCancelFakeState.interrupts.at(-1), {
+    threadId: timedOutStored.threadId,
+    turnId: timedOutStored.turnId
+  });
 
   run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,

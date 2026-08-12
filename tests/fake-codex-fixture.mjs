@@ -480,6 +480,23 @@ rl.on("line", (line) => {
 	          break;
 	        }
 
+	        if (BEHAVIOR === "hung-turn-start-foreign-traffic") {
+	          let heartbeat = 0;
+	          setInterval(() => {
+	            heartbeat += 1;
+	            send({
+	              method: "item/commandExecution/outputDelta",
+	              params: {
+	                threadId: "foreign_thread",
+	                turnId: "foreign_turn",
+	                itemId: "foreign_command",
+	                delta: "foreign progress " + heartbeat
+	              }
+	            });
+	          }, 20);
+	          break;
+	        }
+
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
 	        if (BEHAVIOR === "missing-turn-terminal") {
@@ -653,7 +670,7 @@ rl.on("line", (line) => {
 	          let heartbeat = 0;
 	          const heartbeatTimer = setInterval(() => {
 	            heartbeat += 1;
-	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "reasoning", id: "active_heartbeat_" + heartbeat, summary: [{ text: "The active command is still producing progress." }], content: [] } } });
+	            send({ method: "item/commandExecution/outputDelta", params: { threadId: thread.id, turnId, itemId: commandId, delta: "active progress " + heartbeat } });
 	          }, 25);
 	          setTimeout(() => {
 	            clearInterval(heartbeatTimer);
@@ -715,18 +732,27 @@ rl.on("line", (line) => {
 	          if (!state.orphanLateScheduled) {
 	            state.orphanLateScheduled = true;
 	            saveState(state);
+	            const orphanSubThreadId = "orphan_subthread";
+	            setTimeout(() => {
+	              send({
+	                method: "thread/started",
+	                params: {
+	                  threadId: message.params.threadId,
+	                  turnId: message.params.turnId,
+	                  thread: { id: orphanSubThreadId }
+	                }
+	              });
+	            }, 75);
 	            setTimeout(() => {
 	              send({
 	                method: "item/completed",
 	                params: {
-	                  threadId: message.params.threadId,
+	                  threadId: orphanSubThreadId,
+	                  turnId: message.params.turnId,
 	                  item: { type: "fileChange", id: "orphan_file_change", status: "completed", changes: [{ path: "orphan.txt", kind: "add" }] }
 	                }
 	              });
 	            }, 800);
-	            setTimeout(() => {
-	              send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: buildTurn(message.params.turnId, "completed") } });
-	            }, 850);
 	          }
 	          break;
 	        }

@@ -184,9 +184,10 @@ export async function runTrackedJob(job, runner, options = {}) {
   } catch (error) {
     const timedOut = error?.code === TURN_IDLE_TIMEOUT_CODE;
     const interruptAcknowledged = timedOut ? Boolean(error?.interruptAcknowledged) : null;
+    const turnAcknowledged = timedOut ? Boolean(error?.turnAcknowledged ?? error?.turnId) : null;
     const timeoutWindowMs = timedOut ? error?.timeoutWindowMs ?? null : null;
     const errorMessage = timedOut
-      ? buildTurnTimeoutMessage(timeoutWindowMs, interruptAcknowledged)
+      ? buildTurnTimeoutMessage(timeoutWindowMs, interruptAcknowledged, turnAcknowledged)
       : error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
@@ -194,7 +195,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     const threadId = error?.threadId ?? existing.threadId ?? null;
     const turnId = error?.turnId ?? existing.turnId ?? null;
     const capturedOutput = error?.capturedOutput || existing.capturedOutput || null;
-    const orphanThreadIds = timedOut && !interruptAcknowledged && Array.isArray(error?.threadIds) ? error.threadIds : null;
+    const orphanThreadIds = timedOut && turnAcknowledged && !interruptAcknowledged && Array.isArray(error?.threadIds) ? error.threadIds : null;
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
       status: "failed",
@@ -202,7 +203,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       threadId,
       turnId,
-      ...(timedOut ? { interruptAcknowledged, timeoutWindowMs } : {}),
+      ...(timedOut ? { interruptAcknowledged, turnAcknowledged, timeoutWindowMs } : {}),
       ...(orphanThreadIds ? { orphanThreadIds } : {}),
       ...(capturedOutput ? { capturedOutput } : {}),
       pid: null,
@@ -215,7 +216,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       phase,
       threadId,
       turnId,
-      ...(timedOut ? { interruptAcknowledged, timeoutWindowMs } : {}),
+      ...(timedOut ? { interruptAcknowledged, turnAcknowledged, timeoutWindowMs } : {}),
       ...(orphanThreadIds ? { orphanThreadIds } : {}),
       pid: null,
       errorMessage,

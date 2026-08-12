@@ -12,6 +12,8 @@ import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 const DEFAULT_STREAM_LEASE_MS = 65 * 60 * 1000;
 const STREAM_LEASE_MARGIN_MS = 60 * 1000;
+const ORPHAN_QUARANTINE_TTL_MS = 30 * 60 * 1000;
+const MAX_ORPHAN_QUARANTINES = 32;
 
 function resolveStreamLeaseMs() {
   const configured = timeoutFromEnv(process.env, "CODEX_COMPANION_BROKER_STREAM_LEASE_MS", DEFAULT_STREAM_LEASE_MS);
@@ -88,8 +90,63 @@ async function main() {
   let activeStreamLease = null;
   let runtimeAlive = true;
   let shuttingDown = false;
-  const orphanThreadIds = new Set();
+  const orphanQuarantines = new Map();
   const sockets = new Set();
+
+  function orphanQuarantineKey(threadId, turnId) {
+    return `${threadId}\u0000${turnId}`;
+  }
+
+  function purgeExpiredOrphanQuarantines() {
+    const now = Date.now();
+    for (const [key, entry] of orphanQuarantines) {
+      if (entry.expiresAt <= now) {
+        orphanQuarantines.delete(key);
+      }
+    }
+  }
+
+  function addOrphanQuarantine(threadId, turnId) {
+    if (!threadId || !turnId) {
+      return;
+    }
+    purgeExpiredOrphanQuarantines();
+    const key = orphanQuarantineKey(threadId, turnId);
+    orphanQuarantines.delete(key);
+    orphanQuarantines.set(key, { threadId, turnId, expiresAt: Date.now() + ORPHAN_QUARANTINE_TTL_MS });
+    while (orphanQuarantines.size > MAX_ORPHAN_QUARANTINES) {
+      orphanQuarantines.delete(orphanQuarantines.keys().next().value);
+    }
+  }
+
+  function hasOrphanQuarantine(threadId, turnId) {
+    purgeExpiredOrphanQuarantines();
+    return Boolean(threadId && turnId && orphanQuarantines.has(orphanQuarantineKey(threadId, turnId)));
+  }
+
+  function hasQuarantinedTurn(turnId) {
+    purgeExpiredOrphanQuarantines();
+    return Boolean(turnId && [...orphanQuarantines.values()].some((entry) => entry.turnId === turnId));
+  }
+
+  function clearThreadOrphanQuarantines(threadId) {
+    for (const [key, entry] of orphanQuarantines) {
+      if (entry.threadId === threadId) {
+        orphanQuarantines.delete(key);
+      }
+    }
+  }
+
+  function notificationThreadId(message) {
+    if (message.method === "thread/started") {
+      return message.params?.thread?.id ?? null;
+    }
+    return message.params?.threadId ?? message.params?.thread?.id ?? null;
+  }
+
+  function notificationTurnId(message) {
+    return message.params?.turnId ?? message.params?.turn?.id ?? null;
+  }
 
   function clearActiveStream() {
     if (activeStreamLease?.timer) {
@@ -123,6 +180,9 @@ async function main() {
 
   function setActiveStream(socket, threadIds) {
     clearActiveStream();
+    for (const threadId of threadIds) {
+      clearThreadOrphanQuarantines(threadId);
+    }
     activeStreamSocket = socket;
     activeStreamThreadIds = threadIds;
     activeStreamLease = { socket, expiresAt: 0, timer: null };
@@ -139,11 +199,17 @@ async function main() {
   }
 
   function routeNotification(message) {
-    const threadId = message.params?.threadId ?? null;
-    if (threadId && orphanThreadIds.has(threadId)) {
-      if (message.method === "turn/completed" || message.method === "error") {
-        orphanThreadIds.delete(threadId);
+    const threadId = notificationThreadId(message);
+    const turnId = notificationTurnId(message);
+    if (message.method === "thread/started") {
+      const parentThreadId = message.params?.parentThreadId ?? message.params?.threadId ?? null;
+      const parentTurnId = message.params?.parentTurnId ?? turnId;
+      if (hasOrphanQuarantine(parentThreadId, parentTurnId) || hasQuarantinedTurn(parentTurnId)) {
+        addOrphanQuarantine(threadId, parentTurnId);
+        return;
       }
+    }
+    if (hasOrphanQuarantine(threadId, turnId)) {
       return;
     }
     const target = activeRequestSocket ?? activeStreamSocket;
@@ -243,16 +309,6 @@ async function main() {
           process.exit(0);
         }
 
-        if (message.id !== undefined && message.method === "broker/orphan-threads") {
-          for (const threadId of message.params?.threadIds ?? []) {
-            if (typeof threadId === "string" && threadId) {
-              orphanThreadIds.add(threadId);
-            }
-          }
-          send(socket, { id: message.id, result: {} });
-          continue;
-        }
-
         if (message.id === undefined) {
           continue;
         }
@@ -281,6 +337,24 @@ async function main() {
               error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
             });
           }
+          continue;
+        }
+
+        if (message.method === "broker/orphan-threads") {
+          const ownsStream = activeRequestSocket === socket || activeStreamSocket === socket;
+          if (!ownsStream) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Only the active stream owner can quarantine orphan turns.")
+            });
+            continue;
+          }
+          for (const entry of message.params?.turns ?? []) {
+            if (typeof entry?.threadId === "string" && typeof entry?.turnId === "string") {
+              addOrphanQuarantine(entry.threadId, entry.turnId);
+            }
+          }
+          send(socket, { id: message.id, result: {} });
           continue;
         }
 
