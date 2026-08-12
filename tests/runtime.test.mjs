@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { loadBrokerSession, saveBrokerSession, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -26,6 +26,24 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+function resolveStateDirForEnv(cwd, env) {
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  if (env.CLAUDE_PLUGIN_DATA) {
+    process.env.CLAUDE_PLUGIN_DATA = env.CLAUDE_PLUGIN_DATA;
+  } else {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+  }
+  try {
+    return resolveStateDir(cwd);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -970,6 +988,107 @@ test("task can finish after subagent work even if the parent turn/completed even
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("task times out when turn/completed and the final answer are missing after backend completion", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "missing-turn-terminal");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS: "25",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "25"
+  };
+  const result = run("node", [SCRIPT, "task", "finish work but lose the downstream terminal event"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status > 0, true);
+  assert.match(
+    result.stderr,
+    /Codex turn timed out after 10 minutes without app-server events\. The underlying work may have completed\. Inspect the worktree and rollout\./
+  );
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.deepEqual(fakeState.backendTaskComplete, {
+    threadId: fakeState.lastTurnStart.threadId,
+    turnId: fakeState.lastTurnStart.turnId
+  });
+  assert.deepEqual(fakeState.lastInterrupt, {
+    threadId: fakeState.lastTurnStart.threadId,
+    turnId: fakeState.lastTurnStart.turnId
+  });
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("task does not apply the idle timeout while a command item remains active", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "long-active-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "40",
+    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "1000"
+  };
+  const result = run("node", [SCRIPT, "task", "run the long command"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("broker closes a live downstream task socket when the app-server runtime exits", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "transport-closes-after-turn-start");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = { ...buildEnv(binDir), CLAUDE_PLUGIN_DATA: "" };
+  const result = run("node", [SCRIPT, "task", "observe the runtime exit"], { cwd: repo, env });
+
+  assert.equal(result.status > 0, true);
+  assert.match(result.stderr, /codex app-server connection closed/i);
+  const brokerSession = JSON.parse(
+    fs.readFileSync(path.join(resolveStateDirForEnv(repo, env), "broker.json"), "utf8")
+  );
+  assert.ok(brokerSession);
+  await waitFor(() => waitForBrokerEndpoint(brokerSession.endpoint, 50).then((ready) => !ready));
+  const status = await waitFor(() => {
+    const statusResult = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+    if (statusResult.status !== 0) {
+      return null;
+    }
+    const payload = JSON.parse(statusResult.stdout);
+    return payload.sessionRuntime.mode === "direct" ? payload : null;
+  });
+  assert.equal(status.sessionRuntime.endpoint, null);
+});
+
 test("task using the shared broker still completes when Codex spawns subagents", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1047,6 +1166,62 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("background timeout records timed_out and releases the broker stream owner", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "missing-turn-terminal");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS: "25",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "25",
+    CODEX_COMPANION_BROKER_STREAM_LEASE_MS: "1000"
+  };
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "record the timeout"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const stateDir = resolveStateDirForEnv(repo, env);
+  const jobFile = path.join(stateDir, "jobs", `${jobId}.json`);
+
+  const timedOutJob = await waitFor(() => {
+    if (!fs.existsSync(jobFile)) {
+      return null;
+    }
+    const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return job.status === "failed" ? job : null;
+  });
+  assert.equal(timedOutJob.phase, "timed_out");
+  assert.equal(timedOutJob.pid, null);
+  assert.ok(timedOutJob.completedAt);
+  assert.ok(timedOutJob.threadId);
+  assert.ok(timedOutJob.turnId);
+  assert.equal(
+    timedOutJob.errorMessage,
+    "Codex turn timed out after 10 minutes without app-server events. The underlying work may have completed. Inspect the worktree and rollout."
+  );
+
+  const setup = run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.equal(JSON.parse(setup.stdout).ready, true);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.deepEqual(JSON.parse(fs.readFileSync(jobFile, "utf8")), timedOutJob);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
 });
 
 test("review rejects focus text because it is native-review only", () => {

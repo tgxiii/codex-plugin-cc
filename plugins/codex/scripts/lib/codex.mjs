@@ -6,6 +6,7 @@
  * @typedef {import("./app-server-protocol").ThreadStartParams} ThreadStartParams
  * @typedef {import("./app-server-protocol").Turn} Turn
  * @typedef {import("./app-server-protocol").UserInput} UserInput
+ * @typedef {Error & { code: string, threadId: string, turnId: string | null, capturedOutput: string, notificationTimestamps: Record<string, number> }} TurnTimeoutError
  * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
  * @typedef {{
  *   threadId: string,
@@ -24,6 +25,18 @@
  *   pendingCollaborations: Set<string>,
  *   activeSubagentTurns: Set<string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
+ *   watchdogTimer: ReturnType<typeof setTimeout> | null,
+ *   watchdogDeadline: number | null,
+ *   watchdogFailure: Promise<never>,
+ *   rejectWatchdog: (error: unknown) => void,
+ *   notificationTimestamps: Map<string, number>,
+ *   lastRelevantNotificationAt: number,
+ *   activeItemIds: Map<string, number>,
+ *   idleTimeoutMs: number,
+ *   activeItemTimeoutMs: number,
+ *   interruptDeadlineMs: number,
+ *   interruptGraceMs: number,
+ *   captureEnded: boolean,
  *   lastAgentMessage: string,
  *   reviewText: string,
  *   reasoningSummary: string[],
@@ -50,6 +63,17 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+const TURN_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+const TURN_ACTIVE_ITEM_TIMEOUT_MS = 60 * 60 * 1000;
+const TURN_INTERRUPT_DEADLINE_MS = 5_000;
+const TURN_INTERRUPT_GRACE_MS = 5_000;
+
+export const TURN_IDLE_TIMEOUT_CODE = "TURN_IDLE_TIMEOUT";
+
+function timeoutFromEnv(name, fallback) {
+  const value = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -303,10 +327,18 @@ function describeCompletedItem(state, item) {
 function createTurnCaptureState(threadId, options = {}) {
   let resolveCompletion;
   let rejectCompletion;
+  let rejectWatchdog;
   const completion = new Promise((resolve, reject) => {
     resolveCompletion = resolve;
     rejectCompletion = reject;
   });
+  const watchdogFailure = /** @type {Promise<never>} */ (
+    new Promise((_, reject) => {
+      rejectWatchdog = reject;
+    })
+  );
+  watchdogFailure.catch(() => {});
+  const now = Date.now();
 
   return {
     threadId,
@@ -325,6 +357,18 @@ function createTurnCaptureState(threadId, options = {}) {
     pendingCollaborations: new Set(),
     activeSubagentTurns: new Set(),
     completionTimer: null,
+    watchdogTimer: null,
+    watchdogDeadline: null,
+    watchdogFailure,
+    rejectWatchdog,
+    notificationTimestamps: new Map(),
+    lastRelevantNotificationAt: now,
+    activeItemIds: new Map(),
+    idleTimeoutMs: timeoutFromEnv("CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS", TURN_IDLE_TIMEOUT_MS),
+    activeItemTimeoutMs: timeoutFromEnv("CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS", TURN_ACTIVE_ITEM_TIMEOUT_MS),
+    interruptDeadlineMs: timeoutFromEnv("CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS", TURN_INTERRUPT_DEADLINE_MS),
+    interruptGraceMs: timeoutFromEnv("CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS", TURN_INTERRUPT_GRACE_MS),
+    captureEnded: false,
     lastAgentMessage: "",
     reviewText: "",
     reasoningSummary: [],
@@ -343,12 +387,21 @@ function clearCompletionTimer(state) {
   }
 }
 
+function clearTurnWatchdog(state) {
+  if (state.watchdogTimer) {
+    clearTimeout(state.watchdogTimer);
+    state.watchdogTimer = null;
+  }
+  state.watchdogDeadline = null;
+}
+
 function completeTurn(state, turn = null, options = {}) {
   if (state.completed) {
     return;
   }
 
   clearCompletionTimer(state);
+  clearTurnWatchdog(state);
   state.completed = true;
 
   if (turn) {
@@ -401,6 +454,97 @@ function belongsToTurn(state, message) {
   const trackedTurnId = state.threadTurnIds.get(messageThreadId) ?? null;
   const messageTurnId = extractTurnId(message);
   return trackedTurnId === null || messageTurnId === null || messageTurnId === trackedTurnId;
+}
+
+function activeItemKey(message) {
+  const itemId = message.params?.item?.id;
+  if (!itemId) {
+    return null;
+  }
+  return `${message.params?.threadId ?? "unknown"}:${itemId}`;
+}
+
+function scheduleTurnWatchdog(state, onExpiry) {
+  clearTurnWatchdog(state);
+  if (state.completed || state.captureEnded) {
+    return;
+  }
+
+  const deadline = state.activeItemIds.size > 0
+    ? Math.min(...state.activeItemIds.values()) + state.activeItemTimeoutMs
+    : state.lastRelevantNotificationAt + state.idleTimeoutMs;
+  state.watchdogDeadline = deadline;
+  state.watchdogTimer = setTimeout(() => {
+    state.watchdogTimer = null;
+    void onExpiry(deadline);
+  }, Math.max(0, deadline - Date.now()));
+  state.watchdogTimer.unref?.();
+}
+
+function noteTurnNotification(state, message, onExpiry) {
+  const now = Date.now();
+  state.notificationTimestamps.set(message.method, now);
+  state.lastRelevantNotificationAt = now;
+
+  const itemKey = activeItemKey(message);
+  if (message.method === "item/started" && itemKey && !state.activeItemIds.has(itemKey)) {
+    state.activeItemIds.set(itemKey, now);
+  } else if (message.method === "item/completed" && itemKey) {
+    state.activeItemIds.delete(itemKey);
+  }
+
+  scheduleTurnWatchdog(state, onExpiry);
+}
+
+function createTurnTimeoutError(state) {
+  const error = /** @type {TurnTimeoutError} */ (
+    new Error("Codex turn timed out after 10 minutes without app-server events. The underlying work may have completed. Inspect the worktree and rollout.")
+  );
+  error.code = TURN_IDLE_TIMEOUT_CODE;
+  error.threadId = state.threadId;
+  error.turnId = state.turnId;
+  error.capturedOutput = state.lastAgentMessage || state.reviewText || "";
+  error.notificationTimestamps = Object.fromEntries(state.notificationTimestamps);
+  return error;
+}
+
+async function expireTurnCapture(client, state, expiredDeadline) {
+  if (state.completed || state.captureEnded || state.watchdogDeadline !== expiredDeadline) {
+    return;
+  }
+
+  if (state.threadId && state.turnId) {
+    try {
+      await client.request(
+        "turn/interrupt",
+        { threadId: state.threadId, turnId: state.turnId },
+        { deadlineMs: state.interruptDeadlineMs }
+      );
+    } catch {
+      // The grace period still gives a terminal notification time to arrive.
+    }
+  }
+
+  if (state.completed || state.captureEnded || state.watchdogDeadline !== expiredDeadline) {
+    return;
+  }
+
+  await Promise.race([
+    state.completion.catch(() => {}),
+    new Promise((resolve) => {
+      const timer = setTimeout(resolve, state.interruptGraceMs);
+      timer.unref?.();
+    })
+  ]);
+
+  if (state.completed || state.captureEnded || state.watchdogDeadline !== expiredDeadline) {
+    return;
+  }
+
+  const error = createTurnTimeoutError(state);
+  state.completed = true;
+  state.rejectCompletion(error);
+  state.rejectWatchdog(error);
 }
 
 function recordItem(state, item, lifecycle, threadId = null) {
@@ -559,6 +703,7 @@ function applyTurnNotification(state, message) {
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  const onWatchdogExpiry = (deadline) => expireTurnCapture(client, state, deadline);
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
@@ -567,6 +712,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
 
     if (message.method === "thread/started" || message.method === "thread/name/updated") {
+      noteTurnNotification(state, message, onWatchdogExpiry);
       applyTurnNotification(state, message);
       return;
     }
@@ -578,11 +724,13 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
         return;
     }
 
+    noteTurnNotification(state, message, onWatchdogExpiry);
     applyTurnNotification(state, message);
   });
 
   try {
     const response = await startRequest();
+    state.lastRelevantNotificationAt = Date.now();
     options.onResponse?.(response, state);
     state.turnId = response.turn?.id ?? null;
     if (state.turnId) {
@@ -590,6 +738,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     }
     for (const message of state.bufferedNotifications) {
       if (belongsToTurn(state, message)) {
+        noteTurnNotification(state, message, onWatchdogExpiry);
         applyTurnNotification(state, message);
       } else {
         if (previousHandler) {
@@ -601,11 +750,15 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);
+    } else {
+      scheduleTurnWatchdog(state, onWatchdogExpiry);
     }
 
-    return await state.completion;
+    return await Promise.race([state.completion, client.transportClosed, state.watchdogFailure]);
   } finally {
+    state.captureEnded = true;
     clearCompletionTimer(state);
+    clearTurnWatchdog(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
 }
@@ -904,7 +1057,22 @@ export function getCodexAvailability(cwd) {
 }
 
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
+  const brokerSession = loadBrokerSession(cwd);
+  let brokerAlive = false;
+  if (Number.isInteger(brokerSession?.pid) && brokerSession.pid > 0) {
+    try {
+      process.kill(brokerSession.pid, 0);
+      brokerAlive = true;
+    } catch (error) {
+      brokerAlive = error?.code === "EPERM";
+    }
+  }
+  const brokerKnownDead = Number.isInteger(brokerSession?.pid) && brokerSession.pid > 0 && !brokerAlive;
+  const configuredEndpoint = env?.[BROKER_ENDPOINT_ENV] ?? null;
+  const configuredBrokerIsDead = configuredEndpoint && configuredEndpoint === brokerSession?.endpoint && brokerKnownDead;
+  const endpoint = configuredBrokerIsDead
+    ? null
+    : configuredEndpoint ?? (brokerKnownDead ? null : brokerSession?.endpoint) ?? null;
   if (endpoint) {
     return {
       mode: "shared",

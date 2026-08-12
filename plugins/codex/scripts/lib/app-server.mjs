@@ -22,6 +22,12 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
+const CLOSE_TIMEOUT_MS = 5_000;
+const REQUEST_DEADLINE_MS = new Map([
+  ["turn/start", 30_000],
+  ["turn/interrupt", 5_000]
+]);
+
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
   title: "Codex Plugin",
@@ -71,6 +77,10 @@ class AppServerClientBase {
     this.exitPromise = new Promise((resolve) => {
       this.resolveExit = resolve;
     });
+    this.transportClosed = new Promise((_, reject) => {
+      this.rejectTransportClosed = reject;
+    });
+    this.transportClosed.catch(() => {});
   }
 
   setNotificationHandler(handler) {
@@ -83,7 +93,7 @@ class AppServerClientBase {
    * @param {import("./app-server-protocol").AppServerRequestParams<M>} params
    * @returns {Promise<import("./app-server-protocol").AppServerResponse<M>>}
    */
-  request(method, params) {
+  request(method, params, options = {}) {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
     }
@@ -92,8 +102,32 @@ class AppServerClientBase {
     this.nextId += 1;
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
-      this.sendMessage({ id, method, params });
+      const deadlineMs = options.deadlineMs ?? REQUEST_DEADLINE_MS.get(method) ?? null;
+      const deadlineTimer = deadlineMs
+        ? setTimeout(() => {
+            this.pending.delete(id);
+            const error = /** @type {Error & { code?: string }} */ (
+              new Error(`codex app-server ${method} timed out after ${deadlineMs}ms.`)
+            );
+            error.code = "APP_SERVER_REQUEST_TIMEOUT";
+            reject(error);
+          }, deadlineMs)
+        : null;
+      deadlineTimer?.unref?.();
+
+      const settle = (callback) => (value) => {
+        if (deadlineTimer) {
+          clearTimeout(deadlineTimer);
+        }
+        callback(value);
+      };
+      this.pending.set(id, { resolve: settle(resolve), reject: settle(reject), method });
+      try {
+        this.sendMessage({ id, method, params });
+      } catch (error) {
+        this.pending.delete(id);
+        settle(reject)(error);
+      }
     });
   }
 
@@ -116,6 +150,9 @@ class AppServerClientBase {
   }
 
   handleLine(line) {
+    if (this.exitResolved) {
+      return;
+    }
     if (!line.trim()) {
       return;
     }
@@ -167,12 +204,31 @@ class AppServerClientBase {
 
     this.exitResolved = true;
     this.exitError = error ?? null;
+    const closureError = this.exitError ?? new Error("codex app-server connection closed.");
 
     for (const pending of this.pending.values()) {
-      pending.reject(this.exitError ?? new Error("codex app-server connection closed."));
+      pending.reject(closureError);
     }
     this.pending.clear();
+    this.rejectTransportClosed(closureError);
     this.resolveExit(undefined);
+  }
+
+  async waitForExit(onTimeout) {
+    let timer = null;
+    await Promise.race([
+      this.exitPromise,
+      new Promise((resolve) => {
+        timer = setTimeout(() => {
+          onTimeout();
+          resolve();
+        }, CLOSE_TIMEOUT_MS);
+        timer.unref?.();
+      })
+    ]);
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 
   sendMessage(_message) {
@@ -231,7 +287,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
   async close() {
     if (this.closed) {
-      await this.exitPromise;
+      await this.waitForExit(() => {});
       return;
     }
 
@@ -262,7 +318,12 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       }, 50).unref?.();
     }
 
-    await this.exitPromise;
+    await this.waitForExit(() => {
+      if (this.proc && this.proc.exitCode === null) {
+        this.proc.kill("SIGKILL");
+      }
+      this.handleExit(new Error("Timed out while closing codex app-server."));
+    });
   }
 
   sendMessage(message) {
@@ -285,9 +346,13 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   async initialize() {
     await new Promise((resolve, reject) => {
       const target = parseBrokerEndpoint(this.endpoint);
+      let connected = false;
       this.socket = net.createConnection({ path: target.path });
       this.socket.setEncoding("utf8");
-      this.socket.on("connect", resolve);
+      this.socket.on("connect", () => {
+        connected = true;
+        resolve();
+      });
       this.socket.on("data", (chunk) => {
         this.handleChunk(chunk);
       });
@@ -298,6 +363,9 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
         this.handleExit(error);
       });
       this.socket.on("close", () => {
+        if (!connected) {
+          reject(this.exitError ?? new Error("codex app-server broker connection closed before initialization."));
+        }
         this.handleExit(this.exitError);
       });
     });
@@ -311,7 +379,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
 
   async close() {
     if (this.closed) {
-      await this.exitPromise;
+      await this.waitForExit(() => {});
       return;
     }
 
@@ -319,7 +387,10 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     if (this.socket) {
       this.socket.end();
     }
-    await this.exitPromise;
+    await this.waitForExit(() => {
+      this.socket?.destroy();
+      this.handleExit(new Error("Timed out while closing the codex app-server broker connection."));
+    });
   }
 
   sendMessage(message) {

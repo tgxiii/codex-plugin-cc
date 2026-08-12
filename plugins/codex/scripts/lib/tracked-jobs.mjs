@@ -4,6 +4,8 @@ import process from "node:process";
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+const TURN_TIMEOUT_MESSAGE = "Codex turn timed out after 10 minutes without app-server events. The underlying work may have completed. Inspect the worktree and rollout.";
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 export function nowIso() {
   return new Date().toISOString();
@@ -99,18 +101,19 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-
     const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
+    const storedJob = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
+    if (storedJob && TERMINAL_JOB_STATUSES.has(storedJob.status)) {
       return;
     }
 
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
+    upsertJob(workspaceRoot, patch);
+    if (storedJob) {
+      writeJobFile(workspaceRoot, jobId, {
+        ...storedJob,
+        ...patch
+      });
+    }
   };
 }
 
@@ -179,14 +182,22 @@ export async function runTrackedJob(job, runner, options = {}) {
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
+    const timedOut = error?.code === "TURN_IDLE_TIMEOUT";
+    const errorMessage = timedOut ? TURN_TIMEOUT_MESSAGE : error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
+    const phase = timedOut ? "timed_out" : "failed";
+    const threadId = error?.threadId ?? existing.threadId ?? null;
+    const turnId = error?.turnId ?? existing.turnId ?? null;
+    const capturedOutput = error?.capturedOutput || existing.capturedOutput || null;
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
       status: "failed",
-      phase: "failed",
+      phase,
       errorMessage,
+      threadId,
+      turnId,
+      ...(capturedOutput ? { capturedOutput } : {}),
       pid: null,
       completedAt,
       logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
@@ -194,11 +205,16 @@ export async function runTrackedJob(job, runner, options = {}) {
     upsertJob(job.workspaceRoot, {
       id: job.id,
       status: "failed",
-      phase: "failed",
+      phase,
+      threadId,
+      turnId,
       pid: null,
       errorMessage,
       completedAt
     });
+    if (timedOut) {
+      appendLogLine(options.logFile ?? job.logFile ?? existing.logFile ?? null, errorMessage);
+    }
     throw error;
   }
 }

@@ -10,6 +10,12 @@ import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const DEFAULT_STREAM_LEASE_MS = 65 * 60 * 1000;
+
+function streamLeaseMs() {
+  const configured = Number.parseInt(process.env.CODEX_COMPANION_BROKER_STREAM_LEASE_MS ?? "", 10);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_STREAM_LEASE_MS;
+}
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -69,15 +75,55 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let activeStreamLease = null;
+  let runtimeAlive = true;
+  let shuttingDown = false;
   const sockets = new Set();
+
+  function clearActiveStream() {
+    if (activeStreamLease?.timer) {
+      clearTimeout(activeStreamLease.timer);
+    }
+    activeStreamSocket = null;
+    activeStreamThreadIds = null;
+    activeStreamLease = null;
+  }
+
+  function refreshActiveStreamLease() {
+    if (!activeStreamSocket || !activeStreamLease) {
+      return;
+    }
+    if (activeStreamLease.timer) {
+      clearTimeout(activeStreamLease.timer);
+    }
+    const durationMs = streamLeaseMs();
+    activeStreamLease.expiresAt = Date.now() + durationMs;
+    const lease = activeStreamLease;
+    lease.timer = setTimeout(() => {
+      if (activeStreamLease !== lease || activeStreamSocket !== lease.socket) {
+        return;
+      }
+      const owner = lease.socket;
+      clearActiveStream();
+      owner.destroy();
+    }, durationMs);
+    lease.timer.unref?.();
+  }
+
+  function setActiveStream(socket, threadIds) {
+    clearActiveStream();
+    activeStreamSocket = socket;
+    activeStreamThreadIds = threadIds;
+    activeStreamLease = { socket, expiresAt: 0, timer: null };
+    refreshActiveStreamLease();
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
     }
     if (activeStreamSocket === socket) {
-      activeStreamSocket = null;
-      activeStreamThreadIds = null;
+      clearActiveStream();
     }
   }
 
@@ -87,11 +133,11 @@ async function main() {
       return;
     }
     send(target, message);
+    refreshActiveStreamLease();
     if (message.method === "turn/completed" && activeStreamSocket === target) {
       const threadId = message.params?.threadId ?? null;
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
-        activeStreamSocket = null;
-        activeStreamThreadIds = null;
+        clearActiveStream();
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
@@ -99,11 +145,20 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
-    for (const socket of sockets) {
-      socket.end();
+  async function shutdown(server, options = {}) {
+    if (shuttingDown) {
+      return;
     }
-    await appClient.close().catch(() => {});
+    shuttingDown = true;
+    runtimeAlive = false;
+    clearActiveStream();
+    activeRequestSocket = null;
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    if (options.closeAppClient !== false) {
+      await appClient.close().catch(() => {});
+    }
     await new Promise((resolve) => server.close(resolve));
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
@@ -116,6 +171,10 @@ async function main() {
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
+    if (!runtimeAlive) {
+      socket.destroy();
+      return;
+    }
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
@@ -144,6 +203,10 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "initialize") {
+          if (!runtimeAlive) {
+            socket.destroy();
+            continue;
+          }
           send(socket, {
             id: message.id,
             result: {
@@ -196,13 +259,16 @@ async function main() {
 
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        if (isStreaming) {
+          setActiveStream(socket, buildStreamThreadIds(message.method, message.params ?? {}, null));
+        }
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          if (isStreaming) {
-            activeStreamSocket = socket;
+          if (isStreaming && activeStreamSocket === socket) {
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            refreshActiveStreamLease();
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
@@ -215,8 +281,8 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
-          if (activeStreamSocket === socket && !isStreaming) {
-            activeStreamSocket = null;
+          if (activeStreamSocket === socket && isStreaming) {
+            clearActiveStream();
           }
         }
       }
@@ -231,6 +297,18 @@ async function main() {
       sockets.delete(socket);
       clearSocketOwnership(socket);
     });
+  });
+
+  appClient.transportClosed.catch(async () => {
+    if (shuttingDown) {
+      return;
+    }
+    runtimeAlive = false;
+    if (activeStreamSocket) {
+      activeStreamSocket.destroy();
+    }
+    await shutdown(server, { closeAppClient: false });
+    process.exitCode = 1;
   });
 
   process.on("SIGTERM", async () => {

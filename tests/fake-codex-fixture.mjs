@@ -454,6 +454,21 @@ rl.on("line", (line) => {
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
+	        if (BEHAVIOR === "missing-turn-terminal") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          setTimeout(() => {
+	            state.backendTaskComplete = { threadId: thread.id, turnId };
+	            saveState(state);
+	          }, 20);
+	          break;
+	        }
+
+	        if (BEHAVIOR === "transport-closes-after-turn-start") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          setTimeout(() => process.exit(0), 20);
+	          break;
+	        }
+
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
@@ -585,7 +600,32 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "long-active-task") {
+	          const commandId = "command_" + turnId;
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({
+	            method: "item/started",
+	            params: {
+	              threadId: thread.id,
+	              turnId,
+	              item: { type: "commandExecution", id: commandId, command: "sleep 0.15", status: "inProgress" }
+	            }
+	          });
+	          setTimeout(() => {
+	            send({
+	              method: "item/completed",
+	              params: {
+	                threadId: thread.id,
+	                turnId,
+	                item: { type: "commandExecution", id: commandId, command: "sleep 0.15", status: "completed", exitCode: 0 }
+	              }
+	            });
+	            for (const entry of items) {
+	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
+	            }
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, 150);
+	        } else if (BEHAVIOR === "interruptible-slow-task") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
