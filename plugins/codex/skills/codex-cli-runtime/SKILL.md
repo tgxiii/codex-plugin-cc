@@ -21,12 +21,13 @@ Execution rules:
 - Leave `--effort` unset unless the user explicitly requests a specific effort.
 - Leave model unset by default. Add `--model` only when the user explicitly asks for one.
 - Map `spark` to `--model gpt-5.3-codex-spark`.
+- Pass the `sol`, `terra`, and `luna` tiers as the literal aliases `--model sol`, `--model terra`, `--model luna`; the companion script resolves them to concrete model ids. Never expand a tier into a versioned id yourself — guessed ids (e.g. `gpt-5.4-codex-luna`) do not exist and are rejected by the backend.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
-- If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
+- If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark`, keep `sol`/`terra`/`luna` as-is (the companion resolves them), and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.

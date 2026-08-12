@@ -29,7 +29,9 @@ Forwarding rules:
 - Leave `--effort` unset unless the user explicitly requests a specific reasoning effort.
 - Leave model unset by default. Only add `--model` when the user explicitly asks for a specific model.
 - If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
-- If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
+- If the user asks for the `sol`, `terra`, or `luna` tier (in any phrasing, e.g. "use Luna", "Terra high"), pass the literal alias: `--model sol`, `--model terra`, or `--model luna`. The companion script resolves the alias to the current concrete model id.
+- Never expand a tier name into a versioned model id yourself (e.g. never invent `gpt-5.4-codex-luna`); guessed ids do not exist and the backend rejects them with a misleading "model is not supported when using Codex with a ChatGPT account" error.
+- If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model` only when it is verbatim from the user; do not construct one.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
