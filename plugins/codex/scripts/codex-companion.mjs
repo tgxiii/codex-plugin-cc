@@ -71,9 +71,9 @@ const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const MODEL_ALIASES = new Map([
   ["spark", "gpt-5.3-codex-spark"],
-  ["sol", "gpt-5.6-sol"],
+  ["sol", "gpt-6-sol"],
   ["terra", "gpt-5.6-terra"],
-  ["luna", "gpt-5.6-luna"],
+  ["luna", "gpt-6-luna"],
   ["astra", "gpt-6-astra"]
 ]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
