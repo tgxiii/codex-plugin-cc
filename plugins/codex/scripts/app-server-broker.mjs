@@ -4,6 +4,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient, resolveTurnWatchdogConfig, timeoutFromEnv } from "./lib/app-server.mjs";
@@ -15,17 +16,17 @@ const STREAM_LEASE_MARGIN_MS = 60 * 1000;
 const ORPHAN_QUARANTINE_TTL_MS = 30 * 60 * 1000;
 const MAX_ORPHAN_QUARANTINES = 32;
 
-function resolveStreamLeaseMs() {
-  const configured = timeoutFromEnv(process.env, "CODEX_COMPANION_BROKER_STREAM_LEASE_MS", DEFAULT_STREAM_LEASE_MS);
-  const watchdog = resolveTurnWatchdogConfig(process.env);
-  const floor = Math.max(watchdog.idleTimeoutMs, watchdog.activeItemTimeoutMs) + STREAM_LEASE_MARGIN_MS;
+export function resolveStreamLeaseMs(env = process.env) {
+  const configured = timeoutFromEnv(env, "CODEX_COMPANION_BROKER_STREAM_LEASE_MS", DEFAULT_STREAM_LEASE_MS);
+  const watchdog = resolveTurnWatchdogConfig(env);
+  const floor = Math.min(Math.max(watchdog.idleTimeoutMs, watchdog.activeItemTimeoutMs) + STREAM_LEASE_MARGIN_MS, 2_147_483_647);
   if (configured < floor) {
     process.stderr.write(
       `Configured broker stream lease ${configured}ms is below the watchdog safety floor ${floor}ms. Using ${floor}ms.\n`
     );
     return floor;
   }
-  return configured;
+  return Math.min(configured, 2_147_483_647);
 }
 
 function buildStreamThreadIds(method, params, result) {
@@ -420,7 +421,9 @@ async function main() {
   server.listen(listenTarget.path);
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}
