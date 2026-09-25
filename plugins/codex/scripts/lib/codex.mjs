@@ -407,7 +407,7 @@ function completeTurn(state, turn = null, options = {}) {
     return;
   }
 
-  if (state.watchdogFired) {
+  if (state.watchdogFired && turn?.status !== "completed") {
     failTimedOutTurn(state, state.watchdogFired.windowMs, state.watchdogFired.interruptAcknowledged);
     return;
   }
