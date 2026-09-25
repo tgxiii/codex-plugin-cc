@@ -538,11 +538,13 @@ rl.on("line", (line) => {
 	        if (BEHAVIOR === "other-thread-completes-with-active-item") {
 	          const subThread = nextThread(state, thread.cwd, true);
 	          const subTurnId = nextTurnId(state);
-	          send({ method: "thread/started", params: { thread: { ...buildThread(subThread), parentThreadId: thread.id } } });
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
-	          send({ method: "turn/started", params: { threadId: subThread.id, turn: buildTurn(subTurnId) } });
 	          send({ method: "item/started", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: "running_" + turnId, command: "long command", status: "inProgress" } } });
-	          setTimeout(() => send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } }), 20);
+	          setTimeout(() => {
+	            send({ method: "thread/started", params: { thread: { ...buildThread(subThread), parentThreadId: thread.id } } });
+	            send({ method: "turn/started", params: { threadId: subThread.id, turn: buildTurn(subTurnId) } });
+	          }, 20);
+	          setTimeout(() => send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } }), 50);
 	          setTimeout(() => {
 	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: "running_" + turnId, command: "long command", status: "completed", exitCode: 0 } } });
 	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: "Long command finished.", phase: "final_answer" } } });
