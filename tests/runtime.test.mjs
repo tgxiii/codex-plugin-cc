@@ -1217,6 +1217,8 @@ test("timed-out turn quarantines child turns from real thread/started shape and 
   const second = run("node", [SCRIPT, "task", "--resume", "finish without orphan output"], { cwd: repo, env: resumedEnv });
   assert.equal(second.status, 0, second.stderr);
   assert.match(second.stdout, /Handled the requested task/);
+  const afterResumeFakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(afterResumeFakeState.orphanEmitted.afterTurnId, afterResumeFakeState.lastTurnStart.turnId);
 
   const finalState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   const completedJob = finalState.jobs.find((job) => job.status === "completed");

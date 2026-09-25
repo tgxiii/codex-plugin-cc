@@ -498,6 +498,20 @@ rl.on("line", (line) => {
 	        }
 
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	        if (BEHAVIOR === "orphan-contamination" && state.orphanLateScheduled && !state.orphanEmitted) {
+	          state.orphanEmitted = { afterTurnId: turnId };
+	          saveState(state);
+	          const orphanSubThreadId = "orphan_subthread";
+	          send({ method: "thread/started", params: { thread: { id: orphanSubThreadId, parentThreadId: state.orphanThreadId } } });
+	          send({
+	            method: "item/completed",
+	            params: {
+	              threadId: orphanSubThreadId,
+	              turnId: "orphan_subturn",
+	              item: { type: "fileChange", id: "orphan_file_change", status: "completed", changes: [{ path: "orphan.txt", kind: "add" }] }
+	            }
+	          });
+	        }
 
 	        if (BEHAVIOR === "missing-turn-terminal" || BEHAVIOR === "interrupt-completes-turn") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
@@ -752,26 +766,8 @@ rl.on("line", (line) => {
 	        if (BEHAVIOR === "orphan-contamination" && message.params.turnId === state.orphanTurnId) {
 	          if (!state.orphanLateScheduled) {
 	            state.orphanLateScheduled = true;
+	            state.orphanThreadId = message.params.threadId;
 	            saveState(state);
-	            const orphanSubThreadId = "orphan_subthread";
-	            setTimeout(() => {
-	              send({
-	                method: "thread/started",
-	                params: {
-	                  thread: { id: orphanSubThreadId, parentThreadId: message.params.threadId }
-	                }
-	              });
-	            }, 75);
-	            setTimeout(() => {
-	              send({
-	                method: "item/completed",
-	                params: {
-	                  threadId: orphanSubThreadId,
-	                  turnId: "orphan_subturn",
-	                  item: { type: "fileChange", id: "orphan_file_change", status: "completed", changes: [{ path: "orphan.txt", kind: "add" }] }
-	                }
-	              });
-	            }, 800);
 	          }
 	          break;
 	        }
