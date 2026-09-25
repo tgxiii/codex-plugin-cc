@@ -7,7 +7,9 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { buildTurnTimeoutMessage, timeoutFromEnv } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { resolveStreamLeaseMs } from "../plugins/codex/scripts/app-server-broker.mjs";
+import { loadBrokerSession, saveBrokerSession, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { loadState, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -15,6 +17,16 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+test("invalid watchdog and broker lease values use their defaults", () => {
+  assert.equal(timeoutFromEnv({ CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "10m" }, "CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS", 600000), 600000);
+  assert.equal(timeoutFromEnv({ CODEX_COMPANION_BROKER_STREAM_LEASE_MS: "10m" }, "CODEX_COMPANION_BROKER_STREAM_LEASE_MS", 3900000), 3900000);
+  assert.equal(timeoutFromEnv({ CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "9999999999" }, "CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS", 600000), 2147483647);
+});
+
+test("broker stream lease stays within Node's timer limit when the active timeout is clamped", () => {
+  assert.equal(resolveStreamLeaseMs({ CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "9999999999" }), 2_147_483_647);
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -26,6 +38,24 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error("Timed out waiting for condition.");
+}
+
+function resolveStateDirForEnv(cwd, env) {
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  if (env.CLAUDE_PLUGIN_DATA) {
+    process.env.CLAUDE_PLUGIN_DATA = env.CLAUDE_PLUGIN_DATA;
+  } else {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+  }
+  try {
+    return resolveStateDir(cwd);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
 }
 
 test("setup reports ready when fake codex is installed and authenticated", () => {
@@ -1033,6 +1063,297 @@ test("task can finish after subagent work even if the parent turn/completed even
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("task times out when turn/completed and the final answer are missing after backend completion", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "missing-turn-terminal");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS: "25",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "25"
+  };
+  const result = run("node", [SCRIPT, "task", "finish work but lose the downstream terminal event"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status > 0, true);
+  assert.match(
+    result.stderr,
+    new RegExp(buildTurnTimeoutMessage(50, true).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+  );
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.deepEqual(fakeState.backendTaskComplete, {
+    threadId: fakeState.lastTurnStart.threadId,
+    turnId: fakeState.lastTurnStart.turnId
+  });
+  assert.deepEqual(fakeState.lastInterrupt, {
+    threadId: fakeState.lastTurnStart.threadId,
+    turnId: fakeState.lastTurnStart.turnId
+  });
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("task does not apply the idle timeout while a command item remains active", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "long-active-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "300",
+    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "2000"
+  };
+  const result = run("node", [SCRIPT, "task", "run the long command"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("subagent completion keeps the parent command on the active timeout", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "other-thread-completes-with-active-item");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "300",
+    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "2000"
+  };
+  const result = run("node", [SCRIPT, "task", "wait for the parent command"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Long command finished/);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastInterrupt, null);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("non-retrying error drains its thread's active item and restores the short idle window", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "active-item-error");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "2000",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "25"
+  };
+  const result = run("node", [SCRIPT, "task", "observe the failed active item"], { cwd: repo, env });
+
+  assert.equal(result.status > 0, true);
+  assert.match(result.stderr, new RegExp(buildTurnTimeoutMessage(50, true).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("turn/start can acknowledge after 30 seconds when pre-ack events remain healthy", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-turn-start-ack");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    FAKE_CODEX_TURN_START_ACK_DELAY_MS: "30100",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "200"
+  };
+  const result = run("node", [SCRIPT, "task", "wait for the healthy delayed acknowledgment"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("foreign pre-ack traffic does not refresh a hung turn/start watchdog", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "hung-turn-start-foreign-traffic");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS: "25",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "25"
+  };
+  const result = run("node", [SCRIPT, "task", "ignore foreign pre-ack traffic"], { cwd: repo, env });
+
+  assert.equal(result.status > 0, true);
+  assert.match(result.stderr, /turn did not acknowledge/i);
+  assert.match(result.stderr, /\/codex:cancel cannot reach it/i);
+  const stateDir = resolveStateDirForEnv(repo, env);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const timedOutJob = state.jobs.find((job) => job.phase === "timed_out");
+  assert.equal(timedOutJob.turnAcknowledged, false);
+  assert.equal(timedOutJob.orphanThreadIds, undefined);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("timed-out turn quarantines child turns from real thread/started shape and remains cancellable", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "orphan-contamination");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS: "25",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "25"
+  };
+  const first = run("node", [SCRIPT, "task", "start the orphan-prone turn"], { cwd: repo, env });
+  assert.equal(first.status > 0, true);
+  assert.match(first.stderr, /underlying turn may still be running; the working tree may still be written to/i);
+
+  const stateDir = resolveStateDirForEnv(repo, env);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const timedOutJob = state.jobs.find((job) => job.phase === "timed_out");
+  assert.ok(timedOutJob);
+  assert.match(first.stderr, new RegExp(`/codex:cancel ${timedOutJob.id}`));
+  const timedOutStored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${timedOutJob.id}.json`), "utf8"));
+  assert.match(timedOutStored.errorMessage, new RegExp(`/codex:cancel ${timedOutJob.id}`));
+  assert.equal(timedOutStored.interruptAcknowledged, false);
+  assert.equal(timedOutStored.timeoutWindowMs, 50);
+  assert.ok(timedOutStored.orphanThreadIds.includes(timedOutStored.threadId));
+
+  const result = run("node", [SCRIPT, "result", timedOutJob.id], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Captured output:/);
+  assert.match(result.stdout, /Partial output before the downstream stream stalled\./);
+
+  const resumedEnv = { ...env, CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "2000" };
+  const second = run("node", [SCRIPT, "task", "--resume", "finish without orphan output"], { cwd: repo, env: resumedEnv });
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stdout, /Handled the requested task/);
+  const afterResumeFakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(afterResumeFakeState.orphanEmitted.afterTurnId, afterResumeFakeState.lastTurnStart.turnId);
+
+  const finalState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const completedJob = finalState.jobs.find((job) => job.status === "completed");
+  assert.ok(completedJob);
+  const completedStored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${completedJob.id}.json`), "utf8"));
+  assert.deepEqual(completedStored.result.touchedFiles, []);
+
+  const bareCancel = run("node", [SCRIPT, "cancel", "--json"], { cwd: repo, env });
+  assert.equal(bareCancel.status > 0, true);
+  assert.match(bareCancel.stderr, /No active Codex jobs to cancel/);
+
+  const interruptsBeforeCancel = JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).interrupts.length;
+  const cancel = run("node", [SCRIPT, "cancel", timedOutJob.id, "--json"], { cwd: repo, env });
+  assert.equal(cancel.status, 0, cancel.stderr);
+  assert.equal(JSON.parse(cancel.stdout).turnInterruptAttempted, true);
+  const afterCancelFakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(afterCancelFakeState.interrupts.length, interruptsBeforeCancel + 1);
+  assert.deepEqual(afterCancelFakeState.interrupts.at(-1), {
+    threadId: timedOutStored.threadId,
+    turnId: timedOutStored.turnId
+  });
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env: resumedEnv,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("broker closes a live downstream task socket when the app-server runtime exits", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "transport-closes-after-turn-start");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = { ...buildEnv(binDir), CLAUDE_PLUGIN_DATA: "" };
+  const result = run("node", [SCRIPT, "task", "observe the runtime exit"], { cwd: repo, env });
+
+  assert.equal(result.status > 0, true);
+  assert.match(result.stderr, /codex app-server connection closed/i);
+  const brokerSession = JSON.parse(
+    fs.readFileSync(path.join(resolveStateDirForEnv(repo, env), "broker.json"), "utf8")
+  );
+  assert.ok(brokerSession);
+  await waitFor(() => waitForBrokerEndpoint(brokerSession.endpoint, 50).then((ready) => !ready));
+  const status = await waitFor(() => {
+    const statusResult = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+    if (statusResult.status !== 0) {
+      return null;
+    }
+    const payload = JSON.parse(statusResult.stdout);
+    return payload.sessionRuntime.mode === "direct" ? payload : null;
+  });
+  assert.equal(status.sessionRuntime.endpoint, null);
+});
+
 test("task using the shared broker still completes when Codex spawns subagents", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1110,6 +1431,108 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("background timeout records timed_out and releases the broker stream owner", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "missing-turn-terminal");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_INTERRUPT_DEADLINE_MS: "25",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "25",
+    CODEX_COMPANION_BROKER_STREAM_LEASE_MS: "1000"
+  };
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "record the timeout"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const stateDir = resolveStateDirForEnv(repo, env);
+  const jobFile = path.join(stateDir, "jobs", `${jobId}.json`);
+
+  const timedOutJob = await waitFor(() => {
+    if (!fs.existsSync(jobFile)) {
+      return null;
+    }
+    const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return job.status === "failed" ? job : null;
+  });
+  assert.equal(timedOutJob.phase, "timed_out");
+  assert.equal(timedOutJob.pid, null);
+  assert.ok(timedOutJob.completedAt);
+  assert.ok(timedOutJob.threadId);
+  assert.ok(timedOutJob.turnId);
+  assert.equal(
+    timedOutJob.errorMessage,
+    buildTurnTimeoutMessage(50, true)
+  );
+  assert.equal(timedOutJob.interruptAcknowledged, true);
+  assert.equal(timedOutJob.timeoutWindowMs, 50);
+  const brokerSession = JSON.parse(fs.readFileSync(path.join(stateDir, "broker.json"), "utf8"));
+  assert.match(fs.readFileSync(brokerSession.logFile, "utf8"), /watchdog safety floor/);
+
+  const setup = run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.equal(JSON.parse(setup.stdout).ready, true);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.deepEqual(JSON.parse(fs.readFileSync(jobFile, "utf8")), timedOutJob);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("interrupted completion after watchdog expiry records timed_out guidance", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interrupt-completes-turn");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "100"
+  };
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "record interrupted timeout"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const stateDir = resolveStateDirForEnv(repo, env);
+  const jobFile = path.join(stateDir, "jobs", `${jobId}.json`);
+  const timedOutJob = await waitFor(() => {
+    if (!fs.existsSync(jobFile)) {
+      return null;
+    }
+    const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return job.status === "failed" ? job : null;
+  });
+
+  assert.equal(timedOutJob.phase, "timed_out");
+  assert.equal(timedOutJob.timeoutWindowMs, 50);
+  assert.equal(timedOutJob.interruptAcknowledged, true);
+  assert.equal(timedOutJob.errorMessage, buildTurnTimeoutMessage(50, true));
+  assert.match(timedOutJob.errorMessage, /work may have completed\. Inspect the worktree and rollout/);
+  assert.match(fs.readFileSync(timedOutJob.logFile, "utf8"), /work may have completed\. Inspect the worktree and rollout/);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
 });
 
 test("background task records a pid-less spawn failure", () => {

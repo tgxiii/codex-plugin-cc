@@ -452,11 +452,116 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
-	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	        const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
+	          ? structuredReviewPayload(prompt)
+	          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
 
-        const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
-          ? structuredReviewPayload(prompt)
-          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+	        if (BEHAVIOR === "slow-turn-start-ack") {
+	          const delayMs = Number(process.env.FAKE_CODEX_TURN_START_ACK_DELAY_MS || 100);
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          let heartbeat = 0;
+	          const heartbeatTimer = setInterval(() => {
+	            heartbeat += 1;
+	            send({
+	              method: "item/completed",
+	              params: {
+	                threadId: thread.id,
+	                turnId,
+	                item: { type: "reasoning", id: "heartbeat_" + turnId + "_" + heartbeat, summary: [{ text: "Still working before turn/start acknowledgment." }], content: [] }
+	              }
+	            });
+	          }, 50);
+	          setTimeout(() => {
+	            clearInterval(heartbeatTimer);
+	            send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" } } });
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, delayMs);
+	          break;
+	        }
+
+	        if (BEHAVIOR === "hung-turn-start-foreign-traffic") {
+	          let heartbeat = 0;
+	          setInterval(() => {
+	            heartbeat += 1;
+	            send({
+	              method: "item/commandExecution/outputDelta",
+	              params: {
+	                threadId: "foreign_thread",
+	                turnId: "foreign_turn",
+	                itemId: "foreign_command",
+	                delta: "foreign progress " + heartbeat
+	              }
+	            });
+	          }, 20);
+	          break;
+	        }
+
+	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+	        if (BEHAVIOR === "orphan-contamination" && state.orphanLateScheduled && !state.orphanEmitted) {
+	          setTimeout(() => {
+	            state.orphanEmitted = { afterTurnId: turnId };
+	            saveState(state);
+	            const orphanSubThreadId = "orphan_subthread";
+	            send({ method: "thread/started", params: { thread: { id: orphanSubThreadId, parentThreadId: state.orphanThreadId } } });
+	            send({
+	              method: "item/completed",
+	              params: {
+	                threadId: orphanSubThreadId,
+	                turnId: "orphan_subturn",
+	                item: { type: "fileChange", id: "orphan_file_change", status: "completed", changes: [{ path: "orphan.txt", kind: "add" }] }
+	              }
+	            });
+	          }, 30);
+	        }
+
+	        if (BEHAVIOR === "missing-turn-terminal" || BEHAVIOR === "interrupt-completes-turn") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          setTimeout(() => {
+	            state.backendTaskComplete = { threadId: thread.id, turnId };
+	            saveState(state);
+	          }, 20);
+	          break;
+	        }
+
+	        if (BEHAVIOR === "transport-closes-after-turn-start") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          setTimeout(() => process.exit(0), 20);
+	          break;
+	        }
+
+	        if (BEHAVIOR === "active-item-error") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "item/started", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: "stuck_" + turnId, command: "stuck command", status: "inProgress" } } });
+	          send({ method: "error", params: { threadId: thread.id, turnId, willRetry: false, error: { message: "The active item failed without a terminal event." } } });
+	          break;
+	        }
+
+	        if (BEHAVIOR === "other-thread-completes-with-active-item") {
+	          const subThread = nextThread(state, thread.cwd, true);
+	          const subTurnId = nextTurnId(state);
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "item/started", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: "running_" + turnId, command: "long command", status: "inProgress" } } });
+	          setTimeout(() => {
+	            send({ method: "thread/started", params: { thread: { ...buildThread(subThread), parentThreadId: thread.id } } });
+	            send({ method: "turn/started", params: { threadId: subThread.id, turn: buildTurn(subTurnId) } });
+	          }, 25);
+	          setTimeout(() => send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } }), 50);
+	          setTimeout(() => {
+	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: "running_" + turnId, command: "long command", status: "completed", exitCode: 0 } } });
+	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: "Long command finished.", phase: "final_answer" } } });
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, 800);
+	          break;
+	        }
+
+	        if (BEHAVIOR === "orphan-contamination" && !state.orphanTurnId) {
+	          state.orphanTurnId = turnId;
+	          saveState(state);
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "partial_" + turnId, text: "Partial output before the downstream stream stalled.", phase: "analysis" } } });
+	          break;
+	        }
 
         if (
           BEHAVIOR === "with-subagent" ||
@@ -585,7 +690,40 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "long-active-task") {
+	          const commandId = "command_" + turnId;
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({
+	            method: "item/started",
+	            params: {
+	              threadId: thread.id,
+	              turnId,
+	              item: { type: "commandExecution", id: commandId, command: "sleep 0.7", status: "inProgress" }
+	            }
+	          });
+	          setTimeout(() => {
+	            send({
+	              method: "item/completed",
+	              params: {
+	                threadId: thread.id,
+	                turnId,
+	                item: { type: "commandExecution", id: commandId, command: "sleep 0.15", status: "completed", exitCode: 0 }
+	              }
+	            });
+	            for (const entry of items) {
+	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
+	            }
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, 700);
+	        } else if (BEHAVIOR === "orphan-contamination") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          setTimeout(() => {
+	            for (const entry of items) {
+	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
+	            }
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, 1200);
+	        } else if (BEHAVIOR === "interruptible-slow-task") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -609,11 +747,28 @@ rl.on("line", (line) => {
 	      }
 
 	      case "turn/interrupt": {
+	        state.interrupts = [...(state.interrupts || []), {
+	          threadId: message.params.threadId,
+	          turnId: message.params.turnId
+	        }];
 	        state.lastInterrupt = {
 	          threadId: message.params.threadId,
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "interrupt-completes-turn") {
+	          send({ id: message.id, result: {} });
+	          setTimeout(() => send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: buildTurn(message.params.turnId, "interrupted") } }), 5);
+	          break;
+	        }
+	        if (BEHAVIOR === "orphan-contamination" && message.params.turnId === state.orphanTurnId) {
+	          if (!state.orphanLateScheduled) {
+	            state.orphanLateScheduled = true;
+	            state.orphanThreadId = message.params.threadId;
+	            saveState(state);
+	          }
+	          break;
+	        }
 	        const pending = interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);

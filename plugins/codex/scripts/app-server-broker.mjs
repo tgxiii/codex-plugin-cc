@@ -4,12 +4,30 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import { BROKER_BUSY_RPC_CODE, CodexAppServerClient, resolveTurnWatchdogConfig, timeoutFromEnv } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const DEFAULT_STREAM_LEASE_MS = 65 * 60 * 1000;
+const STREAM_LEASE_MARGIN_MS = 60 * 1000;
+const ORPHAN_QUARANTINE_TTL_MS = 30 * 60 * 1000;
+const MAX_ORPHAN_QUARANTINES = 32;
+
+export function resolveStreamLeaseMs(env = process.env) {
+  const configured = timeoutFromEnv(env, "CODEX_COMPANION_BROKER_STREAM_LEASE_MS", DEFAULT_STREAM_LEASE_MS);
+  const watchdog = resolveTurnWatchdogConfig(env);
+  const floor = Math.min(Math.max(watchdog.idleTimeoutMs, watchdog.activeItemTimeoutMs) + STREAM_LEASE_MARGIN_MS, 2_147_483_647);
+  if (configured < floor) {
+    process.stderr.write(
+      `Configured broker stream lease ${configured}ms is below the watchdog safety floor ${floor}ms. Using ${floor}ms.\n`
+    );
+    return floor;
+  }
+  return Math.min(configured, 2_147_483_647);
+}
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -63,35 +81,142 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const leaseDurationMs = resolveStreamLeaseMs();
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let activeStreamLease = null;
+  let runtimeAlive = true;
+  let shuttingDown = false;
+  const orphanQuarantines = new Map();
   const sockets = new Set();
+
+  function orphanQuarantineKey(threadId, turnId) {
+    return `${threadId}\u0000${turnId}`;
+  }
+
+  function purgeExpiredOrphanQuarantines() {
+    const now = Date.now();
+    for (const [key, entry] of orphanQuarantines) {
+      if (entry.expiresAt <= now) {
+        orphanQuarantines.delete(key);
+      }
+    }
+  }
+
+  function addOrphanQuarantine(threadId, turnId, allTurns = false) {
+    if (!threadId || !turnId) {
+      return;
+    }
+    purgeExpiredOrphanQuarantines();
+    const key = orphanQuarantineKey(threadId, turnId);
+    orphanQuarantines.delete(key);
+    orphanQuarantines.set(key, { threadId, turnId, allTurns, expiresAt: Date.now() + ORPHAN_QUARANTINE_TTL_MS });
+    while (orphanQuarantines.size > MAX_ORPHAN_QUARANTINES) {
+      orphanQuarantines.delete(orphanQuarantines.keys().next().value);
+    }
+  }
+
+  function hasOrphanQuarantine(threadId, turnId) {
+    purgeExpiredOrphanQuarantines();
+    return Boolean(threadId && [...orphanQuarantines.values()].some(
+      (entry) => entry.threadId === threadId && (entry.allTurns || entry.turnId === turnId)
+    ));
+  }
+
+  function quarantinedTurnIdsForThread(threadId) {
+    purgeExpiredOrphanQuarantines();
+    return [...orphanQuarantines.values()]
+      .filter((entry) => entry.threadId === threadId)
+      .map((entry) => entry.turnId);
+  }
+
+  function notificationThreadId(message) {
+    if (message.method === "thread/started") {
+      return message.params?.thread?.id ?? null;
+    }
+    return message.params?.threadId ?? message.params?.thread?.id ?? null;
+  }
+
+  function notificationTurnId(message) {
+    return message.params?.turnId ?? message.params?.turn?.id ?? null;
+  }
+
+  function clearActiveStream() {
+    if (activeStreamLease?.timer) {
+      clearTimeout(activeStreamLease.timer);
+    }
+    activeStreamSocket = null;
+    activeStreamThreadIds = null;
+    activeStreamLease = null;
+  }
+
+  function refreshActiveStreamLease() {
+    if (!activeStreamSocket || !activeStreamLease) {
+      return;
+    }
+    if (activeStreamLease.timer) {
+      clearTimeout(activeStreamLease.timer);
+    }
+    const durationMs = leaseDurationMs;
+    activeStreamLease.expiresAt = Date.now() + durationMs;
+    const lease = activeStreamLease;
+    lease.timer = setTimeout(() => {
+      if (activeStreamLease !== lease || activeStreamSocket !== lease.socket) {
+        return;
+      }
+      const owner = lease.socket;
+      clearActiveStream();
+      owner.destroy();
+    }, durationMs);
+    lease.timer.unref?.();
+  }
+
+  function setActiveStream(socket, threadIds) {
+    clearActiveStream();
+    activeStreamSocket = socket;
+    activeStreamThreadIds = threadIds;
+    activeStreamLease = { socket, expiresAt: 0, timer: null };
+    refreshActiveStreamLease();
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
     }
     if (activeStreamSocket === socket) {
-      activeStreamSocket = null;
-      activeStreamThreadIds = null;
+      clearActiveStream();
     }
   }
 
   function routeNotification(message) {
+    const threadId = notificationThreadId(message);
+    const turnId = notificationTurnId(message);
+    if (message.method === "thread/started") {
+      const parentThreadId = message.params?.thread?.parentThreadId ?? null;
+      const inheritedTurnIds = quarantinedTurnIdsForThread(parentThreadId);
+      for (const inheritedTurnId of inheritedTurnIds) {
+        addOrphanQuarantine(threadId, inheritedTurnId, true);
+      }
+      if (inheritedTurnIds.length > 0) {
+        return;
+      }
+    }
+    if (hasOrphanQuarantine(threadId, turnId)) {
+      return;
+    }
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
     }
     send(target, message);
+    refreshActiveStreamLease();
     if (message.method === "turn/completed" && activeStreamSocket === target) {
-      const threadId = message.params?.threadId ?? null;
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
-        activeStreamSocket = null;
-        activeStreamThreadIds = null;
+        clearActiveStream();
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
@@ -99,11 +224,20 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
-    for (const socket of sockets) {
-      socket.end();
+  async function shutdown(server, options = {}) {
+    if (shuttingDown) {
+      return;
     }
-    await appClient.close().catch(() => {});
+    shuttingDown = true;
+    runtimeAlive = false;
+    clearActiveStream();
+    activeRequestSocket = null;
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    if (options.closeAppClient !== false) {
+      await appClient.close().catch(() => {});
+    }
     await new Promise((resolve) => server.close(resolve));
     if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
       fs.unlinkSync(listenTarget.path);
@@ -116,6 +250,10 @@ async function main() {
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
+    if (!runtimeAlive) {
+      socket.destroy();
+      return;
+    }
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
@@ -144,6 +282,10 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "initialize") {
+          if (!runtimeAlive) {
+            socket.destroy();
+            continue;
+          }
           send(socket, {
             id: message.id,
             result: {
@@ -194,15 +336,36 @@ async function main() {
           continue;
         }
 
+        if (message.method === "broker/orphan-threads") {
+          const ownsStream = activeRequestSocket === socket || activeStreamSocket === socket;
+          if (!ownsStream) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Only the active stream owner can quarantine orphan turns.")
+            });
+            continue;
+          }
+          for (const entry of message.params?.turns ?? []) {
+            if (typeof entry?.threadId === "string" && typeof entry?.turnId === "string") {
+              addOrphanQuarantine(entry.threadId, entry.turnId);
+            }
+          }
+          send(socket, { id: message.id, result: {} });
+          continue;
+        }
+
         const isStreaming = STREAMING_METHODS.has(message.method);
         activeRequestSocket = socket;
+        if (isStreaming) {
+          setActiveStream(socket, buildStreamThreadIds(message.method, message.params ?? {}, null));
+        }
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
-          if (isStreaming) {
-            activeStreamSocket = socket;
+          if (isStreaming && activeStreamSocket === socket) {
             activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            refreshActiveStreamLease();
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
@@ -215,8 +378,8 @@ async function main() {
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
           }
-          if (activeStreamSocket === socket && !isStreaming) {
-            activeStreamSocket = null;
+          if (activeStreamSocket === socket && isStreaming) {
+            clearActiveStream();
           }
         }
       }
@@ -233,6 +396,18 @@ async function main() {
     });
   });
 
+  appClient.transportClosed.catch(async () => {
+    if (shuttingDown) {
+      return;
+    }
+    runtimeAlive = false;
+    if (activeStreamSocket) {
+      activeStreamSocket.destroy();
+    }
+    await shutdown(server, { closeAppClient: false });
+    process.exitCode = 1;
+  });
+
   process.on("SIGTERM", async () => {
     await shutdown(server);
     process.exit(0);
@@ -246,7 +421,9 @@ async function main() {
   server.listen(listenTarget.path);
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}

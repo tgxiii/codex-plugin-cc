@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import process from "node:process";
 
+import { buildTurnTimeoutMessage, TURN_IDLE_TIMEOUT_CODE } from "./app-server.mjs";
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 export function nowIso() {
   return new Date().toISOString();
@@ -99,18 +101,19 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-
     const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
+    const storedJob = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
+    if (storedJob && TERMINAL_JOB_STATUSES.has(storedJob.status)) {
       return;
     }
 
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
+    upsertJob(workspaceRoot, patch);
+    if (storedJob) {
+      writeJobFile(workspaceRoot, jobId, {
+        ...storedJob,
+        ...patch
+      });
+    }
   };
 }
 
@@ -179,14 +182,34 @@ export async function runTrackedJob(job, runner, options = {}) {
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
+    const timedOut = error?.code === TURN_IDLE_TIMEOUT_CODE;
+    const interruptAcknowledged = timedOut ? Boolean(error?.interruptAcknowledged) : null;
+    const turnAcknowledged = timedOut ? Boolean(error?.turnAcknowledged ?? error?.turnId) : null;
+    const timeoutWindowMs = timedOut ? error?.timeoutWindowMs ?? null : null;
+    const errorMessage = timedOut
+      ? buildTurnTimeoutMessage(timeoutWindowMs, interruptAcknowledged, turnAcknowledged, job.id)
+      : error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
+    const phase = timedOut ? "timed_out" : "failed";
+    const threadId = error?.threadId ?? existing.threadId ?? null;
+    const turnId = error?.turnId ?? existing.turnId ?? null;
+    const capturedOutput = error?.capturedOutput || existing.capturedOutput || null;
+    const orphanThreadIds = timedOut && turnAcknowledged && !interruptAcknowledged && Array.isArray(error?.threadIds) ? error.threadIds : null;
+    if (timedOut) {
+      appendLogLine(options.logFile ?? job.logFile ?? existing.logFile ?? null, errorMessage);
+      error.message = errorMessage;
+    }
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
       status: "failed",
-      phase: "failed",
+      phase,
       errorMessage,
+      threadId,
+      turnId,
+      ...(timedOut ? { interruptAcknowledged, turnAcknowledged, timeoutWindowMs } : {}),
+      ...(orphanThreadIds ? { orphanThreadIds } : {}),
+      ...(capturedOutput ? { capturedOutput } : {}),
       pid: null,
       completedAt,
       logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
@@ -194,7 +217,11 @@ export async function runTrackedJob(job, runner, options = {}) {
     upsertJob(job.workspaceRoot, {
       id: job.id,
       status: "failed",
-      phase: "failed",
+      phase,
+      threadId,
+      turnId,
+      ...(timedOut ? { interruptAcknowledged, turnAcknowledged, timeoutWindowMs } : {}),
+      ...(orphanThreadIds ? { orphanThreadIds } : {}),
       pid: null,
       errorMessage,
       completedAt

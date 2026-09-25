@@ -57,3 +57,23 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.match(output, /Codex session ID: thr_123/);
   assert.match(output, /Resume in Codex: codex resume thr_123/);
 });
+
+test("renderStoredJobResult includes captured output from a timed-out job", () => {
+  const output = renderStoredJobResult(
+    {
+      id: "task-timeout",
+      status: "failed",
+      phase: "timed_out",
+      title: "Codex Task",
+      errorMessage: "The turn timed out."
+    },
+    {
+      capturedOutput: "Partial answer before the stream stalled.",
+      errorMessage: "The turn timed out."
+    }
+  );
+
+  assert.match(output, /Captured output:/);
+  assert.match(output, /Partial answer before the stream stalled\./);
+  assert.match(output, /The turn timed out\./);
+});

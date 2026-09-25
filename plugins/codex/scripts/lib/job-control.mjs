@@ -281,16 +281,19 @@ export function resolveResultJob(cwd, reference) {
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
+  const cancelableJobs = jobs.filter(
+    (job) => job.status === "queued" || job.status === "running" || (job.status === "failed" && job.phase === "timed_out")
+  );
 
   if (reference) {
-    const selected = matchJobReference(activeJobs, reference);
+    const selected = matchJobReference(cancelableJobs, reference);
     if (!selected) {
       throw new Error(`No active job found for "${reference}".`);
     }
     return { workspaceRoot, job: selected };
   }
 
+  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
   const sessionScopedActiveJobs = filterJobsForCurrentSession(activeJobs, options);
 
   if (sessionScopedActiveJobs.length === 1) {
