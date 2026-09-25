@@ -545,13 +545,13 @@ rl.on("line", (line) => {
 	          setTimeout(() => {
 	            send({ method: "thread/started", params: { thread: { ...buildThread(subThread), parentThreadId: thread.id } } });
 	            send({ method: "turn/started", params: { threadId: subThread.id, turn: buildTurn(subTurnId) } });
-	          }, 20);
+	          }, 25);
 	          setTimeout(() => send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } }), 50);
 	          setTimeout(() => {
 	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: "running_" + turnId, command: "long command", status: "completed", exitCode: 0 } } });
 	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: "Long command finished.", phase: "final_answer" } } });
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
-	          }, 150);
+	          }, 800);
 	          break;
 	        }
 
@@ -698,16 +698,10 @@ rl.on("line", (line) => {
 	            params: {
 	              threadId: thread.id,
 	              turnId,
-	              item: { type: "commandExecution", id: commandId, command: "sleep 0.15", status: "inProgress" }
+	              item: { type: "commandExecution", id: commandId, command: "sleep 0.7", status: "inProgress" }
 	            }
 	          });
-	          let heartbeat = 0;
-	          const heartbeatTimer = setInterval(() => {
-	            heartbeat += 1;
-	            send({ method: "item/commandExecution/outputDelta", params: { threadId: thread.id, turnId, itemId: commandId, delta: "active progress " + heartbeat } });
-	          }, 25);
 	          setTimeout(() => {
-	            clearInterval(heartbeatTimer);
 	            send({
 	              method: "item/completed",
 	              params: {
@@ -720,7 +714,7 @@ rl.on("line", (line) => {
 	              send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
 	            }
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
-	          }, 250);
+	          }, 700);
 	        } else if (BEHAVIOR === "orphan-contamination") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          setTimeout(() => {

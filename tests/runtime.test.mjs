@@ -1056,8 +1056,8 @@ test("task does not apply the idle timeout while a command item remains active",
   const env = {
     ...buildEnv(binDir),
     CLAUDE_PLUGIN_DATA: "",
-    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "40",
-    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "80"
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "300",
+    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "2000"
   };
   const result = run("node", [SCRIPT, "task", "run the long command"], { cwd: repo, env });
 
@@ -1083,8 +1083,8 @@ test("subagent completion keeps the parent command on the active timeout", () =>
   const env = {
     ...buildEnv(binDir),
     CLAUDE_PLUGIN_DATA: "",
-    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "40",
-    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "500"
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "300",
+    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "2000"
   };
   const result = run("node", [SCRIPT, "task", "wait for the parent command"], { cwd: repo, env });
 
