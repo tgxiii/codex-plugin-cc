@@ -368,6 +368,7 @@ function createTurnCaptureState(threadId, options = {}) {
     completionTimer: null,
     watchdogTimer: null,
     watchdogDeadline: null,
+    watchdogFired: null,
     watchdogFailure,
     rejectWatchdog,
     notificationTimestamps: new Map(),
@@ -403,6 +404,11 @@ function clearTurnWatchdog(state) {
 
 function completeTurn(state, turn = null, options = {}) {
   if (state.completed) {
+    return;
+  }
+
+  if (state.watchdogFired) {
+    failTimedOutTurn(state, state.watchdogFired.windowMs, state.watchdogFired.interruptAcknowledged);
     return;
   }
 
@@ -531,10 +537,23 @@ function createTurnTimeoutError(state, timeoutWindowMs, interruptAcknowledged) {
   return error;
 }
 
+function failTimedOutTurn(state, timeoutWindowMs, interruptAcknowledged) {
+  const error = createTurnTimeoutError(state, timeoutWindowMs, interruptAcknowledged);
+  state.completed = true;
+  state.rejectCompletion(error);
+  state.rejectWatchdog(error);
+}
+
 async function expireTurnCapture(client, state, expiredDeadline, timeoutWindowMs) {
   if (state.completed || state.captureEnded || state.watchdogDeadline !== expiredDeadline) {
     return;
   }
+
+  state.watchdogFired = {
+    windowMs: timeoutWindowMs,
+    reason: state.activeItemIds.size > 0 ? "active_item" : "idle",
+    interruptAcknowledged: false
+  };
 
   let interruptAcknowledged = false;
   if (state.threadId && state.turnId) {
@@ -545,6 +564,7 @@ async function expireTurnCapture(client, state, expiredDeadline, timeoutWindowMs
         { deadlineMs: state.interruptDeadlineMs }
       );
       interruptAcknowledged = true;
+      state.watchdogFired.interruptAcknowledged = true;
     } catch {
       // The grace period still gives a terminal notification time to arrive.
     }
@@ -577,10 +597,7 @@ async function expireTurnCapture(client, state, expiredDeadline, timeoutWindowMs
     }
   }
 
-  const error = createTurnTimeoutError(state, timeoutWindowMs, interruptAcknowledged);
-  state.completed = true;
-  state.rejectCompletion(error);
-  state.rejectWatchdog(error);
+  failTimedOutTurn(state, timeoutWindowMs, interruptAcknowledged);
 }
 
 function recordItem(state, item, lifecycle, threadId = null) {

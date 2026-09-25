@@ -1415,6 +1415,48 @@ test("background timeout records timed_out and releases the broker stream owner"
   });
 });
 
+test("interrupted completion after watchdog expiry records timed_out guidance", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interrupt-completes-turn");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "50",
+    CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS: "100"
+  };
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "record interrupted timeout"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const stateDir = resolveStateDirForEnv(repo, env);
+  const jobFile = path.join(stateDir, "jobs", `${jobId}.json`);
+  const timedOutJob = await waitFor(() => {
+    if (!fs.existsSync(jobFile)) {
+      return null;
+    }
+    const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return job.status === "failed" ? job : null;
+  });
+
+  assert.equal(timedOutJob.phase, "timed_out");
+  assert.equal(timedOutJob.timeoutWindowMs, 50);
+  assert.equal(timedOutJob.interruptAcknowledged, true);
+  assert.equal(timedOutJob.errorMessage, buildTurnTimeoutMessage(50, true));
+  assert.match(timedOutJob.errorMessage, /work may have completed\. Inspect the worktree and rollout/);
+  assert.match(fs.readFileSync(timedOutJob.logFile, "utf8"), /work may have completed\. Inspect the worktree and rollout/);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

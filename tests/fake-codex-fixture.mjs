@@ -499,7 +499,7 @@ rl.on("line", (line) => {
 
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
-	        if (BEHAVIOR === "missing-turn-terminal") {
+	        if (BEHAVIOR === "missing-turn-terminal" || BEHAVIOR === "interrupt-completes-turn") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          setTimeout(() => {
 	            state.backendTaskComplete = { threadId: thread.id, turnId };
@@ -744,6 +744,11 @@ rl.on("line", (line) => {
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "interrupt-completes-turn") {
+	          send({ id: message.id, result: {} });
+	          setTimeout(() => send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: buildTurn(message.params.turnId, "interrupted") } }), 5);
+	          break;
+	        }
 	        if (BEHAVIOR === "orphan-contamination" && message.params.turnId === state.orphanTurnId) {
 	          if (!state.orphanLateScheduled) {
 	            state.orphanLateScheduled = true;
