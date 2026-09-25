@@ -187,7 +187,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     const turnAcknowledged = timedOut ? Boolean(error?.turnAcknowledged ?? error?.turnId) : null;
     const timeoutWindowMs = timedOut ? error?.timeoutWindowMs ?? null : null;
     const errorMessage = timedOut
-      ? buildTurnTimeoutMessage(timeoutWindowMs, interruptAcknowledged, turnAcknowledged)
+      ? buildTurnTimeoutMessage(timeoutWindowMs, interruptAcknowledged, turnAcknowledged, job.id)
       : error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
@@ -224,6 +224,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     });
     if (timedOut) {
       appendLogLine(options.logFile ?? job.logFile ?? existing.logFile ?? null, errorMessage);
+      error.message = errorMessage;
     }
     throw error;
   }

@@ -68,12 +68,12 @@ function formatTimeoutWindow(timeoutMs) {
   return `${timeoutMs} milliseconds`;
 }
 
-export function buildTurnTimeoutMessage(timeoutMs, interruptAcknowledged, turnAcknowledged = true) {
+export function buildTurnTimeoutMessage(timeoutMs, interruptAcknowledged, turnAcknowledged = true, jobId = null) {
   const outcome = !turnAcknowledged
     ? "The turn did not acknowledge, so /codex:cancel cannot reach it. Inspect the worktree and rollout."
     : interruptAcknowledged
       ? "The underlying work may have completed. Inspect the worktree and rollout."
-      : "The underlying turn may still be running; the working tree may still be written to. Retry /codex:cancel before continuing.";
+      : `The underlying turn may still be running; the working tree may still be written to. Retry /codex:cancel${jobId ? ` ${jobId}` : " <job-id>"} before continuing.`;
   return `Codex turn timed out after ${formatTimeoutWindow(timeoutMs)} without app-server events. ${outcome}`;
 }
 

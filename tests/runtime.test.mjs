@@ -1209,7 +1209,9 @@ test("timed-out turn quarantines child turns from real thread/started shape and 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   const timedOutJob = state.jobs.find((job) => job.phase === "timed_out");
   assert.ok(timedOutJob);
+  assert.match(first.stderr, new RegExp(`/codex:cancel ${timedOutJob.id}`));
   const timedOutStored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${timedOutJob.id}.json`), "utf8"));
+  assert.match(timedOutStored.errorMessage, new RegExp(`/codex:cancel ${timedOutJob.id}`));
   assert.equal(timedOutStored.interruptAcknowledged, false);
   assert.equal(timedOutStored.timeoutWindowMs, 50);
   assert.ok(timedOutStored.orphanThreadIds.includes(timedOutStored.threadId));
