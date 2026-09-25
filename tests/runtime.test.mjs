@@ -1149,7 +1149,7 @@ test("foreign pre-ack traffic does not refresh a hung turn/start watchdog", () =
   });
 });
 
-test("unacknowledged timeout quarantines orphan notifications and remains cancellable", () => {
+test("timed-out turn quarantines child turns from real thread/started shape and remains cancellable", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");

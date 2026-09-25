@@ -106,14 +106,14 @@ async function main() {
     }
   }
 
-  function addOrphanQuarantine(threadId, turnId) {
+  function addOrphanQuarantine(threadId, turnId, allTurns = false) {
     if (!threadId || !turnId) {
       return;
     }
     purgeExpiredOrphanQuarantines();
     const key = orphanQuarantineKey(threadId, turnId);
     orphanQuarantines.delete(key);
-    orphanQuarantines.set(key, { threadId, turnId, expiresAt: Date.now() + ORPHAN_QUARANTINE_TTL_MS });
+    orphanQuarantines.set(key, { threadId, turnId, allTurns, expiresAt: Date.now() + ORPHAN_QUARANTINE_TTL_MS });
     while (orphanQuarantines.size > MAX_ORPHAN_QUARANTINES) {
       orphanQuarantines.delete(orphanQuarantines.keys().next().value);
     }
@@ -121,20 +121,16 @@ async function main() {
 
   function hasOrphanQuarantine(threadId, turnId) {
     purgeExpiredOrphanQuarantines();
-    return Boolean(threadId && turnId && orphanQuarantines.has(orphanQuarantineKey(threadId, turnId)));
+    return Boolean(threadId && [...orphanQuarantines.values()].some(
+      (entry) => entry.threadId === threadId && (entry.allTurns || entry.turnId === turnId)
+    ));
   }
 
-  function hasQuarantinedTurn(turnId) {
+  function quarantinedTurnIdsForThread(threadId) {
     purgeExpiredOrphanQuarantines();
-    return Boolean(turnId && [...orphanQuarantines.values()].some((entry) => entry.turnId === turnId));
-  }
-
-  function clearThreadOrphanQuarantines(threadId) {
-    for (const [key, entry] of orphanQuarantines) {
-      if (entry.threadId === threadId) {
-        orphanQuarantines.delete(key);
-      }
-    }
+    return [...orphanQuarantines.values()]
+      .filter((entry) => entry.threadId === threadId)
+      .map((entry) => entry.turnId);
   }
 
   function notificationThreadId(message) {
@@ -180,9 +176,6 @@ async function main() {
 
   function setActiveStream(socket, threadIds) {
     clearActiveStream();
-    for (const threadId of threadIds) {
-      clearThreadOrphanQuarantines(threadId);
-    }
     activeStreamSocket = socket;
     activeStreamThreadIds = threadIds;
     activeStreamLease = { socket, expiresAt: 0, timer: null };
@@ -202,10 +195,12 @@ async function main() {
     const threadId = notificationThreadId(message);
     const turnId = notificationTurnId(message);
     if (message.method === "thread/started") {
-      const parentThreadId = message.params?.parentThreadId ?? message.params?.threadId ?? null;
-      const parentTurnId = message.params?.parentTurnId ?? turnId;
-      if (hasOrphanQuarantine(parentThreadId, parentTurnId) || hasQuarantinedTurn(parentTurnId)) {
-        addOrphanQuarantine(threadId, parentTurnId);
+      const parentThreadId = message.params?.thread?.parentThreadId ?? null;
+      const inheritedTurnIds = quarantinedTurnIdsForThread(parentThreadId);
+      for (const inheritedTurnId of inheritedTurnIds) {
+        addOrphanQuarantine(threadId, inheritedTurnId, true);
+      }
+      if (inheritedTurnIds.length > 0) {
         return;
       }
     }

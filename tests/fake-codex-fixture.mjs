@@ -737,9 +737,7 @@ rl.on("line", (line) => {
 	              send({
 	                method: "thread/started",
 	                params: {
-	                  threadId: message.params.threadId,
-	                  turnId: message.params.turnId,
-	                  thread: { id: orphanSubThreadId }
+	                  thread: { id: orphanSubThreadId, parentThreadId: message.params.threadId }
 	                }
 	              });
 	            }, 75);
@@ -748,7 +746,7 @@ rl.on("line", (line) => {
 	                method: "item/completed",
 	                params: {
 	                  threadId: orphanSubThreadId,
-	                  turnId: message.params.turnId,
+	                  turnId: "orphan_subturn",
 	                  item: { type: "fileChange", id: "orphan_file_change", status: "completed", changes: [{ path: "orphan.txt", kind: "add" }] }
 	                }
 	              });
