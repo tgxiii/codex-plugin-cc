@@ -691,17 +691,34 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  let child;
+  try {
+    child = spawnDetachedTaskWorker(cwd, job.id);
+  } catch (error) {
+    const failedRecord = {
+      ...queuedRecord,
+      status: "failed",
+      phase: "failed",
+      errorMessage: error instanceof Error ? error.message : String(error)
+    };
+    writeJobFile(job.workspaceRoot, job.id, failedRecord);
+    upsertJob(job.workspaceRoot, failedRecord);
+    throw error;
+  }
+  const spawnedRecord = { ...queuedRecord, pid: child.pid ?? null };
+  writeJobFile(job.workspaceRoot, job.id, spawnedRecord);
+  upsertJob(job.workspaceRoot, spawnedRecord);
 
   return {
     payload: {

@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { loadState, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -1047,6 +1047,63 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("background task has a queued record and request when enqueue returns", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "--model", "sol", "--effort", "high", "inspect this change"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  const stored = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${jobId}.json`), "utf8"));
+  assert.deepEqual(stored.request, {
+    cwd: repo,
+    model: "gpt-6-sol",
+    effort: "high",
+    prompt: "inspect this change",
+    write: false,
+    resumeLast: false,
+    jobId
+  });
+  assert.equal(loadState(repo).jobs.find((job) => job.id === jobId).request.model, "gpt-6-sol");
+});
+
+test("background task records a spawn failure", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const preload = path.join(repo, "fail-worker-spawn.cjs");
+  fs.writeFileSync(preload, `const childProcess = require("node:child_process");
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (file, args, options) {
+  if (args?.includes("task-worker")) throw new Error("worker spawn failed");
+  return originalSpawn(file, args, options);
+};
+require("node:module").syncBuiltinESMExports();
+`);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "inspect this change"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), NODE_OPTIONS: `--require=${preload}` }
+  });
+
+  assert.equal(launched.status, 1);
+  assert.match(launched.stderr, /worker spawn failed/);
+  const [job] = loadState(repo).jobs;
+  const stored = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${job.id}.json`), "utf8"));
+  assert.equal(job.status, "failed");
+  assert.equal(job.errorMessage, "worker spawn failed");
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.errorMessage, "worker spawn failed");
+  assert.equal(stored.request.prompt, "inspect this change");
 });
 
 test("review rejects focus text because it is native-review only", () => {
