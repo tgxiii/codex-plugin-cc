@@ -10,7 +10,7 @@ import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { buildTurnTimeoutMessage, timeoutFromEnv } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { resolveStreamLeaseMs } from "../plugins/codex/scripts/app-server-broker.mjs";
 import { loadBrokerSession, saveBrokerSession, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { loadState, resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -814,6 +814,69 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+test("foreground task and review jobs store dispatched settings, and native review rejects effort", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const task = run("node", [SCRIPT, "task", "--model", "sol", "--effort", "high", "inspect this change"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  const rejectedReview = run("node", [SCRIPT, "review", "--model", "gpt-6-astra", "--effort", "medium"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  const review = run("node", [SCRIPT, "review", "--model", "gpt-6-astra"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  const adversarial = run("node", [SCRIPT, "adversarial-review", "--model", "gpt-6-sol", "--effort", "high"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(task.status, 0, task.stderr);
+  assert.equal(rejectedReview.status, 1);
+  assert.match(rejectedReview.stderr, /--effort is not supported for review; use adversarial-review/);
+  assert.equal(review.status, 0, review.stderr);
+  assert.equal(adversarial.status, 0, adversarial.stderr);
+  const jobs = loadState(repo).jobs;
+  assert.equal(jobs.filter((job) => job.kind === "review").length, 1);
+  const taskJob = jobs.find((job) => job.kind === "task");
+  const reviewJob = jobs.find((job) => job.kind === "review");
+  const adversarialJob = jobs.find((job) => job.kind === "adversarial-review");
+  const resolvedRepo = fs.realpathSync(repo);
+  assert.deepEqual(taskJob.request, {
+    cwd: resolvedRepo,
+    model: "gpt-6-sol",
+    effort: "high",
+    prompt: "inspect this change",
+    write: false,
+    resumeLast: false,
+    jobId: taskJob.id
+  });
+  assert.deepEqual(reviewJob.request, { cwd: resolvedRepo, model: "gpt-6-astra", effort: null, base: null, scope: null });
+  assert.deepEqual(adversarialJob.request, { cwd: resolvedRepo, model: "gpt-6-sol", effort: "high", base: null, scope: null });
+  const storedTask = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${taskJob.id}.json`), "utf8"));
+  const storedReview = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${reviewJob.id}.json`), "utf8"));
+  assert.equal(storedTask.request.model, "gpt-6-sol");
+  assert.equal(storedReview.request.effort, null);
+  const taskStatus = run("node", [SCRIPT, "status", taskJob.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
+  const reviewResult = run("node", [SCRIPT, "result", reviewJob.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(taskStatus.status, 0, taskStatus.stderr);
+  assert.equal(reviewResult.status, 0, reviewResult.stderr);
+  assert.equal(JSON.parse(taskStatus.stdout).job.request.model, "gpt-6-sol");
+  assert.equal(JSON.parse(reviewResult.stdout).storedJob.request.effort, null);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, "high");
+});
+
 test("task resolves the astra tier alias to its concrete model id", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1470,6 +1533,88 @@ test("interrupted completion after watchdog expiry records timed_out guidance", 
     env,
     input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
   });
+});
+
+test("background task records a pid-less spawn failure", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const preload = path.join(repo, "fail-worker-spawn.cjs");
+  fs.writeFileSync(preload, `const childProcess = require("node:child_process");
+const { EventEmitter } = require("node:events");
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (file, args, options) {
+  if (args?.includes("task-worker")) {
+    const child = new EventEmitter();
+    child.unref = () => {};
+    process.nextTick(() => child.emit("error", new Error("worker spawn failed")));
+    return child;
+  }
+  return originalSpawn(file, args, options);
+};
+require("node:module").syncBuiltinESMExports();
+`);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "inspect this change"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), NODE_OPTIONS: `--require=${preload}` }
+  });
+
+  assert.equal(launched.status, 1);
+  assert.match(launched.stderr, /Failed to spawn background task worker \(no process ID\)/);
+  const [job] = loadState(repo).jobs;
+  const stored = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${job.id}.json`), "utf8"));
+  assert.equal(job.status, "failed");
+  assert.equal(job.errorMessage, "Failed to spawn background task worker (no process ID).");
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.errorMessage, "Failed to spawn background task worker (no process ID).");
+  assert.equal(stored.request.prompt, "inspect this change");
+});
+
+test("background task persists its queued request before spawning the worker", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const preload = path.join(repo, "check-worker-spawn.cjs");
+  const marker = path.join(repo, "record-at-spawn.txt");
+  fs.writeFileSync(preload, `const childProcess = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const { EventEmitter } = require("node:events");
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (file, args, options) {
+  if (args?.includes("task-worker")) {
+    const jobId = args[args.indexOf("--job-id") + 1];
+    let queuedWithRequest = false;
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(process.env.SPAWN_STATE_DIR, "jobs", jobId + ".json"), "utf8"));
+      queuedWithRequest = record.status === "queued" && record.request?.prompt === "inspect this change";
+    } catch {}
+    fs.writeFileSync(process.env.SPAWN_MARKER, String(queuedWithRequest));
+    const child = new EventEmitter();
+    child.unref = () => {};
+    process.nextTick(() => child.emit("error", new Error("worker spawn failed")));
+    return child;
+  }
+  return originalSpawn(file, args, options);
+};
+require("node:module").syncBuiltinESMExports();
+`);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "inspect this change"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      NODE_OPTIONS: `--require=${preload}`,
+      SPAWN_STATE_DIR: resolveStateDir(repo),
+      SPAWN_MARKER: marker
+    }
+  });
+
+  assert.equal(launched.status, 1);
+  assert.equal(fs.readFileSync(marker, "utf8"), "true");
 });
 
 test("review rejects focus text because it is native-review only", () => {
