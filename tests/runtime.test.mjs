@@ -784,6 +784,61 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+test("foreground task and both review jobs store their dispatched model and effort", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const task = run("node", [SCRIPT, "task", "--model", "sol", "--effort", "high", "inspect this change"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  const review = run("node", [SCRIPT, "review", "--model", "gpt-6-astra", "--effort", "medium"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  const adversarial = run("node", [SCRIPT, "adversarial-review", "--model", "gpt-6-sol", "--effort", "high"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(task.status, 0, task.stderr);
+  assert.equal(review.status, 0, review.stderr);
+  assert.equal(adversarial.status, 0, adversarial.stderr);
+  const jobs = loadState(repo).jobs;
+  const taskJob = jobs.find((job) => job.kind === "task");
+  const reviewJob = jobs.find((job) => job.kind === "review");
+  const adversarialJob = jobs.find((job) => job.kind === "adversarial-review");
+  assert.deepEqual(taskJob.request, {
+    cwd: repo,
+    model: "gpt-6-sol",
+    effort: "high",
+    prompt: "inspect this change",
+    write: false,
+    resumeLast: false,
+    jobId: taskJob.id
+  });
+  assert.deepEqual(reviewJob.request, { cwd: repo, model: "gpt-6-astra", effort: "medium", base: null, scope: null });
+  assert.deepEqual(adversarialJob.request, { cwd: repo, model: "gpt-6-sol", effort: "high", base: null, scope: null });
+  const storedTask = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${taskJob.id}.json`), "utf8"));
+  const storedReview = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${reviewJob.id}.json`), "utf8"));
+  assert.equal(storedTask.request.model, "gpt-6-sol");
+  assert.equal(storedReview.request.effort, "medium");
+  const taskStatus = run("node", [SCRIPT, "status", taskJob.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
+  const reviewResult = run("node", [SCRIPT, "result", reviewJob.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(taskStatus.status, 0, taskStatus.stderr);
+  assert.equal(reviewResult.status, 0, reviewResult.stderr);
+  assert.equal(JSON.parse(taskStatus.stdout).job.request.model, "gpt-6-sol");
+  assert.equal(JSON.parse(reviewResult.stdout).storedJob.request.effort, "medium");
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, "high");
+});
+
 test("task resolves the astra tier alias to its concrete model id", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
