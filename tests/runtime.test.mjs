@@ -1148,6 +1148,51 @@ require("node:module").syncBuiltinESMExports();
   assert.equal(stored.request.prompt, "inspect this change");
 });
 
+test("background task persists its queued request before spawning the worker", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const preload = path.join(repo, "check-worker-spawn.cjs");
+  const marker = path.join(repo, "record-at-spawn.txt");
+  fs.writeFileSync(preload, `const childProcess = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const { EventEmitter } = require("node:events");
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = function (file, args, options) {
+  if (args?.includes("task-worker")) {
+    const jobId = args[args.indexOf("--job-id") + 1];
+    let queuedWithRequest = false;
+    try {
+      const record = JSON.parse(fs.readFileSync(path.join(process.env.SPAWN_STATE_DIR, "jobs", jobId + ".json"), "utf8"));
+      queuedWithRequest = record.status === "queued" && record.request?.prompt === "inspect this change";
+    } catch {}
+    fs.writeFileSync(process.env.SPAWN_MARKER, String(queuedWithRequest));
+    const child = new EventEmitter();
+    child.unref = () => {};
+    process.nextTick(() => child.emit("error", new Error("worker spawn failed")));
+    return child;
+  }
+  return originalSpawn(file, args, options);
+};
+require("node:module").syncBuiltinESMExports();
+`);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "inspect this change"], {
+    cwd: repo,
+    env: {
+      ...buildEnv(binDir),
+      NODE_OPTIONS: `--require=${preload}`,
+      SPAWN_STATE_DIR: resolveStateDir(repo),
+      SPAWN_MARKER: marker
+    }
+  });
+
+  assert.equal(launched.status, 1);
+  assert.equal(fs.readFileSync(marker, "utf8"), "true");
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
