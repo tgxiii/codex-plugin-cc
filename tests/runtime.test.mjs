@@ -821,8 +821,9 @@ test("foreground task and review jobs store dispatched settings, and native revi
   const taskJob = jobs.find((job) => job.kind === "task");
   const reviewJob = jobs.find((job) => job.kind === "review");
   const adversarialJob = jobs.find((job) => job.kind === "adversarial-review");
+  const resolvedRepo = fs.realpathSync(repo);
   assert.deepEqual(taskJob.request, {
-    cwd: repo,
+    cwd: resolvedRepo,
     model: "gpt-6-sol",
     effort: "high",
     prompt: "inspect this change",
@@ -830,8 +831,8 @@ test("foreground task and review jobs store dispatched settings, and native revi
     resumeLast: false,
     jobId: taskJob.id
   });
-  assert.deepEqual(reviewJob.request, { cwd: repo, model: "gpt-6-astra", effort: null, base: null, scope: null });
-  assert.deepEqual(adversarialJob.request, { cwd: repo, model: "gpt-6-sol", effort: "high", base: null, scope: null });
+  assert.deepEqual(reviewJob.request, { cwd: resolvedRepo, model: "gpt-6-astra", effort: null, base: null, scope: null });
+  assert.deepEqual(adversarialJob.request, { cwd: resolvedRepo, model: "gpt-6-sol", effort: "high", base: null, scope: null });
   const storedTask = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${taskJob.id}.json`), "utf8"));
   const storedReview = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${reviewJob.id}.json`), "utf8"));
   assert.equal(storedTask.request.model, "gpt-6-sol");
