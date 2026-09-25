@@ -499,18 +499,20 @@ rl.on("line", (line) => {
 
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 	        if (BEHAVIOR === "orphan-contamination" && state.orphanLateScheduled && !state.orphanEmitted) {
-	          state.orphanEmitted = { afterTurnId: turnId };
-	          saveState(state);
-	          const orphanSubThreadId = "orphan_subthread";
-	          send({ method: "thread/started", params: { thread: { id: orphanSubThreadId, parentThreadId: state.orphanThreadId } } });
-	          send({
-	            method: "item/completed",
-	            params: {
-	              threadId: orphanSubThreadId,
-	              turnId: "orphan_subturn",
-	              item: { type: "fileChange", id: "orphan_file_change", status: "completed", changes: [{ path: "orphan.txt", kind: "add" }] }
-	            }
-	          });
+	          setTimeout(() => {
+	            state.orphanEmitted = { afterTurnId: turnId };
+	            saveState(state);
+	            const orphanSubThreadId = "orphan_subthread";
+	            send({ method: "thread/started", params: { thread: { id: orphanSubThreadId, parentThreadId: state.orphanThreadId } } });
+	            send({
+	              method: "item/completed",
+	              params: {
+	                threadId: orphanSubThreadId,
+	                turnId: "orphan_subturn",
+	                item: { type: "fileChange", id: "orphan_file_change", status: "completed", changes: [{ path: "orphan.txt", kind: "add" }] }
+	              }
+	            });
+	          }, 30);
 	        }
 
 	        if (BEHAVIOR === "missing-turn-terminal" || BEHAVIOR === "interrupt-completes-turn") {
