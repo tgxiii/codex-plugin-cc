@@ -721,9 +721,11 @@ function enqueueBackgroundTask(cwd, job, request) {
     upsertJob(job.workspaceRoot, failedRecord);
     throw error;
   }
-  const spawnedRecord = { ...queuedRecord, pid: child.pid ?? null };
-  writeJobFile(job.workspaceRoot, job.id, spawnedRecord);
-  upsertJob(job.workspaceRoot, spawnedRecord);
+  const storedRecord = readStoredJob(job.workspaceRoot, job.id);
+  if (storedRecord?.status === "queued") {
+    writeJobFile(job.workspaceRoot, job.id, { ...storedRecord, pid: child.pid });
+    upsertJob(job.workspaceRoot, { id: job.id, pid: child.pid });
+  }
 
   return {
     payload: {
