@@ -196,6 +196,10 @@ export async function runTrackedJob(job, runner, options = {}) {
     const turnId = error?.turnId ?? existing.turnId ?? null;
     const capturedOutput = error?.capturedOutput || existing.capturedOutput || null;
     const orphanThreadIds = timedOut && turnAcknowledged && !interruptAcknowledged && Array.isArray(error?.threadIds) ? error.threadIds : null;
+    if (timedOut) {
+      appendLogLine(options.logFile ?? job.logFile ?? existing.logFile ?? null, errorMessage);
+      error.message = errorMessage;
+    }
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
       status: "failed",
@@ -222,10 +226,6 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       completedAt
     });
-    if (timedOut) {
-      appendLogLine(options.logFile ?? job.logFile ?? existing.logFile ?? null, errorMessage);
-      error.message = errorMessage;
-    }
     throw error;
   }
 }
