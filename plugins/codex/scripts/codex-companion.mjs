@@ -684,6 +684,10 @@ function spawnDetachedTaskWorker(cwd, jobId) {
     stdio: "ignore",
     windowsHide: true
   });
+  child.once("error", () => {});
+  if (child.pid === undefined) {
+    throw new Error("Failed to spawn background task worker (no process ID).");
+  }
   child.unref();
   return child;
 }

@@ -1130,16 +1130,22 @@ test("background task has a queued record and request when enqueue returns", () 
   assert.equal(loadState(repo).jobs.find((job) => job.id === jobId).request.model, "gpt-6-sol");
 });
 
-test("background task records a spawn failure", () => {
+test("background task records a pid-less spawn failure", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   initGitRepo(repo);
   const preload = path.join(repo, "fail-worker-spawn.cjs");
   fs.writeFileSync(preload, `const childProcess = require("node:child_process");
+const { EventEmitter } = require("node:events");
 const originalSpawn = childProcess.spawn;
 childProcess.spawn = function (file, args, options) {
-  if (args?.includes("task-worker")) throw new Error("worker spawn failed");
+  if (args?.includes("task-worker")) {
+    const child = new EventEmitter();
+    child.unref = () => {};
+    process.nextTick(() => child.emit("error", new Error("worker spawn failed")));
+    return child;
+  }
   return originalSpawn(file, args, options);
 };
 require("node:module").syncBuiltinESMExports();
@@ -1151,13 +1157,13 @@ require("node:module").syncBuiltinESMExports();
   });
 
   assert.equal(launched.status, 1);
-  assert.match(launched.stderr, /worker spawn failed/);
+  assert.match(launched.stderr, /Failed to spawn background task worker \(no process ID\)/);
   const [job] = loadState(repo).jobs;
   const stored = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${job.id}.json`), "utf8"));
   assert.equal(job.status, "failed");
-  assert.equal(job.errorMessage, "worker spawn failed");
+  assert.equal(job.errorMessage, "Failed to spawn background task worker (no process ID).");
   assert.equal(stored.status, "failed");
-  assert.equal(stored.errorMessage, "worker spawn failed");
+  assert.equal(stored.errorMessage, "Failed to spawn background task worker (no process ID).");
   assert.equal(stored.request.prompt, "inspect this change");
 });
 
