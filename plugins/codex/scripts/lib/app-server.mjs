@@ -33,8 +33,15 @@ const REQUEST_DEADLINE_MS = new Map([
 ]);
 
 export function timeoutFromEnv(env, name, fallback) {
-  const value = Number.parseInt(env?.[name] ?? "", 10);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
+  const raw = env?.[name];
+  if (raw === undefined) {
+    return fallback;
+  }
+  if (typeof raw !== "string" || !/^[0-9]+$/.test(raw) || Number(raw) === 0) {
+    process.stderr.write(`Invalid ${name} timeout: expected a positive decimal integer; using the default.\n`);
+    return fallback;
+  }
+  return Math.min(Number(raw), 2_147_483_647);
 }
 
 export function resolveTurnWatchdogConfig(env = process.env) {

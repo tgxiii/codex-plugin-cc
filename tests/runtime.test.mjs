@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { buildTurnTimeoutMessage } from "../plugins/codex/scripts/lib/app-server.mjs";
+import { buildTurnTimeoutMessage, timeoutFromEnv } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { loadBrokerSession, saveBrokerSession, waitForBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -16,6 +16,12 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+test("invalid watchdog and broker lease values use their defaults", () => {
+  assert.equal(timeoutFromEnv({ CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "10m" }, "CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS", 600000), 600000);
+  assert.equal(timeoutFromEnv({ CODEX_COMPANION_BROKER_STREAM_LEASE_MS: "10m" }, "CODEX_COMPANION_BROKER_STREAM_LEASE_MS", 3900000), 3900000);
+  assert.equal(timeoutFromEnv({ CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "9999999999" }, "CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS", 600000), 2147483647);
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
