@@ -517,7 +517,23 @@ rl.on("line", (line) => {
 	        if (BEHAVIOR === "active-item-error") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          send({ method: "item/started", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: "stuck_" + turnId, command: "stuck command", status: "inProgress" } } });
-	          send({ method: "error", params: { threadId: thread.id, turnId, error: { message: "The active item failed without a terminal event." } } });
+	          send({ method: "error", params: { threadId: thread.id, turnId, willRetry: false, error: { message: "The active item failed without a terminal event." } } });
+	          break;
+	        }
+
+	        if (BEHAVIOR === "other-thread-completes-with-active-item") {
+	          const subThread = nextThread(state, thread.cwd, true);
+	          const subTurnId = nextTurnId(state);
+	          send({ method: "thread/started", params: { thread: { ...buildThread(subThread), parentThreadId: thread.id } } });
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "turn/started", params: { threadId: subThread.id, turn: buildTurn(subTurnId) } });
+	          send({ method: "item/started", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: "running_" + turnId, command: "long command", status: "inProgress" } } });
+	          setTimeout(() => send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } }), 20);
+	          setTimeout(() => {
+	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "commandExecution", id: "running_" + turnId, command: "long command", status: "completed", exitCode: 0 } } });
+	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text: "Long command finished.", phase: "final_answer" } } });
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, 150);
 	          break;
 	        }
 

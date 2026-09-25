@@ -502,8 +502,13 @@ function noteTurnNotification(state, message, onExpiry) {
     state.activeItemIds.delete(itemKey);
   }
 
-  if (message.method === "turn/completed" || message.method === "error") {
-    state.activeItemIds.clear();
+  if (message.method === "turn/completed" || (message.method === "error" && !message.params?.willRetry)) {
+    const threadPrefix = `${message.params?.threadId}:`;
+    for (const activeId of state.activeItemIds) {
+      if (activeId.startsWith(threadPrefix)) {
+        state.activeItemIds.delete(activeId);
+      }
+    }
   }
 
   scheduleTurnWatchdog(state, onExpiry);

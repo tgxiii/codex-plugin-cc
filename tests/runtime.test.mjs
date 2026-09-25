@@ -1060,7 +1060,36 @@ test("task does not apply the idle timeout while a command item remains active",
   });
 });
 
-test("error notifications drain active items and restore the short idle window", () => {
+test("subagent completion keeps the parent command on the active timeout", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "other-thread-completes-with-active-item");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = {
+    ...buildEnv(binDir),
+    CLAUDE_PLUGIN_DATA: "",
+    CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "40",
+    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "500"
+  };
+  const result = run("node", [SCRIPT, "task", "wait for the parent command"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Long command finished/);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastInterrupt, null);
+
+  run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+});
+
+test("non-retrying error drains its thread's active item and restores the short idle window", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "active-item-error");
