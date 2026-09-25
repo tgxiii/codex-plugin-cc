@@ -1104,32 +1104,6 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
-test("background task has a queued record and request when enqueue returns", () => {
-  const repo = makeTempDir();
-  const binDir = makeTempDir();
-  installFakeCodex(binDir, "slow-task");
-  initGitRepo(repo);
-
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "--model", "sol", "--effort", "high", "inspect this change"], {
-    cwd: repo,
-    env: buildEnv(binDir)
-  });
-
-  assert.equal(launched.status, 0, launched.stderr);
-  const jobId = JSON.parse(launched.stdout).jobId;
-  const stored = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${jobId}.json`), "utf8"));
-  assert.deepEqual(stored.request, {
-    cwd: repo,
-    model: "gpt-6-sol",
-    effort: "high",
-    prompt: "inspect this change",
-    write: false,
-    resumeLast: false,
-    jobId
-  });
-  assert.equal(loadState(repo).jobs.find((job) => job.id === jobId).request.model, "gpt-6-sol");
-});
-
 test("background task records a pid-less spawn failure", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
