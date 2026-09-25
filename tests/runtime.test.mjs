@@ -784,7 +784,7 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
-test("foreground task and both review jobs store their dispatched model and effort", () => {
+test("foreground task and review jobs store dispatched settings, and native review rejects effort", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -798,7 +798,11 @@ test("foreground task and both review jobs store their dispatched model and effo
     cwd: repo,
     env: buildEnv(binDir)
   });
-  const review = run("node", [SCRIPT, "review", "--model", "gpt-6-astra", "--effort", "medium"], {
+  const rejectedReview = run("node", [SCRIPT, "review", "--model", "gpt-6-astra", "--effort", "medium"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  const review = run("node", [SCRIPT, "review", "--model", "gpt-6-astra"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -808,9 +812,12 @@ test("foreground task and both review jobs store their dispatched model and effo
   });
 
   assert.equal(task.status, 0, task.stderr);
+  assert.equal(rejectedReview.status, 1);
+  assert.match(rejectedReview.stderr, /--effort is not supported for review; use adversarial-review/);
   assert.equal(review.status, 0, review.stderr);
   assert.equal(adversarial.status, 0, adversarial.stderr);
   const jobs = loadState(repo).jobs;
+  assert.equal(jobs.filter((job) => job.kind === "review").length, 1);
   const taskJob = jobs.find((job) => job.kind === "task");
   const reviewJob = jobs.find((job) => job.kind === "review");
   const adversarialJob = jobs.find((job) => job.kind === "adversarial-review");
@@ -823,18 +830,18 @@ test("foreground task and both review jobs store their dispatched model and effo
     resumeLast: false,
     jobId: taskJob.id
   });
-  assert.deepEqual(reviewJob.request, { cwd: repo, model: "gpt-6-astra", effort: "medium", base: null, scope: null });
+  assert.deepEqual(reviewJob.request, { cwd: repo, model: "gpt-6-astra", effort: null, base: null, scope: null });
   assert.deepEqual(adversarialJob.request, { cwd: repo, model: "gpt-6-sol", effort: "high", base: null, scope: null });
   const storedTask = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${taskJob.id}.json`), "utf8"));
   const storedReview = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${reviewJob.id}.json`), "utf8"));
   assert.equal(storedTask.request.model, "gpt-6-sol");
-  assert.equal(storedReview.request.effort, "medium");
+  assert.equal(storedReview.request.effort, null);
   const taskStatus = run("node", [SCRIPT, "status", taskJob.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
   const reviewResult = run("node", [SCRIPT, "result", reviewJob.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
   assert.equal(taskStatus.status, 0, taskStatus.stderr);
   assert.equal(reviewResult.status, 0, reviewResult.stderr);
   assert.equal(JSON.parse(taskStatus.stdout).job.request.model, "gpt-6-sol");
-  assert.equal(JSON.parse(reviewResult.stdout).storedJob.request.effort, "medium");
+  assert.equal(JSON.parse(reviewResult.stdout).storedJob.request.effort, null);
   const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.equal(fakeState.lastTurnStart.effort, "high");
 });
