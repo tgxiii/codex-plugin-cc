@@ -2039,7 +2039,6 @@ test("status --wait times out cleanly when a job is still active", () => {
         id: "task-live",
         status: "running",
         title: "Codex Task",
-        request: { model: "gpt-6-sol", effort: "high", prompt: "Investigate flaky test in detail" },
         logFile
       },
       null,
@@ -2307,6 +2306,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
         id: "task-live",
         status: "running",
         title: "Codex Task",
+        request: { model: "gpt-6-sol", effort: "high", prompt: "Investigate flaky test in detail" },
         logFile
       },
       null,
