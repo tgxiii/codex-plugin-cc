@@ -88,6 +88,8 @@ Use it when you want:
 
 Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
 
+With `--model`, the native review runs on that model; without it, Codex uses `review_model` from its config when set, otherwise its default model. The job record shows the requested model, but Codex does not report which model a native review ran on.
+
 Examples:
 
 ```bash

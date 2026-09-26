@@ -857,7 +857,6 @@ test("foreground task and review jobs store dispatched settings, and native revi
     cwd: resolvedRepo,
     model: "gpt-6-sol",
     effort: "high",
-    prompt: "inspect this change",
     write: false,
     resumeLast: false,
     jobId: taskJob.id
@@ -868,12 +867,19 @@ test("foreground task and review jobs store dispatched settings, and native revi
   const storedReview = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${reviewJob.id}.json`), "utf8"));
   assert.equal(storedReview.request.model, "gpt-6-sol");
   assert.equal(storedTask.request.model, "gpt-6-sol");
+  assert.equal(storedTask.request.prompt, "inspect this change");
+  assert.doesNotMatch(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"), /"prompt"\s*:/);
   assert.equal(storedReview.request.effort, null);
   const taskStatus = run("node", [SCRIPT, "status", taskJob.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
   const reviewResult = run("node", [SCRIPT, "result", reviewJob.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
   assert.equal(taskStatus.status, 0, taskStatus.stderr);
   assert.equal(reviewResult.status, 0, reviewResult.stderr);
   assert.equal(JSON.parse(taskStatus.stdout).job.request.model, "gpt-6-sol");
+  assert.equal(JSON.parse(taskStatus.stdout).job.request.effort, "high");
+  assert.equal(JSON.parse(taskStatus.stdout).job.request.prompt, undefined);
+  const taskResult = run("node", [SCRIPT, "result", taskJob.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(taskResult.status, 0, taskResult.stderr);
+  assert.equal(JSON.parse(taskResult.stdout).storedJob.request.prompt, "inspect this change");
   assert.equal(JSON.parse(reviewResult.stdout).storedJob.request.effort, null);
   const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.equal(fakeState.lastTurnStart.effort, "high");
@@ -894,6 +900,25 @@ test("native review resolves the sol alias before starting its thread", () => {
   assert.equal(loadState(repo).jobs[0].request.model, "gpt-6-sol");
   const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.equal(fakeState.lastThreadStart.model, "gpt-6-sol");
+  assert.deepEqual(fakeState.lastThreadStart.config, { review_model: "gpt-6-sol" });
+});
+
+test("native review without a requested model sends no config override", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const result = run("node", [SCRIPT, "review"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastThreadStart.model, null);
+  assert.equal(Object.hasOwn(fakeState.lastThreadStart, "config"), false);
 });
 
 test("task resolves the astra tier alias to its concrete model id", () => {
@@ -1453,6 +1478,7 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   const waitedPayload = JSON.parse(waitedStatus.stdout);
   assert.equal(waitedPayload.job.id, launchPayload.jobId);
   assert.equal(waitedPayload.job.status, "completed");
+  assert.equal(waitedPayload.job.request.prompt, undefined);
 
   const resultPayload = await waitFor(() => {
     const result = run("node", [SCRIPT, "result", launchPayload.jobId, "--json"], {
@@ -1468,6 +1494,8 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+  assert.equal(resultPayload.storedJob.request.prompt, "investigate the failing test");
+  assert.doesNotMatch(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"), /"prompt"\s*:/);
 });
 
 test("background timeout records timed_out and releases the broker stream owner", async () => {
@@ -2278,6 +2306,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
         id: "task-live",
         status: "running",
         title: "Codex Task",
+        request: { model: "gpt-6-sol", effort: "high", prompt: "Investigate flaky test in detail" },
         logFile
       },
       null,
@@ -2298,6 +2327,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
             title: "Codex Task",
             jobClass: "task",
             summary: "Investigate flaky test",
+            request: { model: "gpt-6-sol", effort: "high" },
             pid: sleeper.pid,
             logFile,
             createdAt: "2026-03-18T15:30:00.000Z",
@@ -2335,6 +2365,8 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
 
   const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
   assert.equal(stored.status, "cancelled");
+  assert.equal(stored.request.prompt, "Investigate flaky test in detail");
+  assert.equal(cancelled.request.prompt, undefined);
   assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
 });
 

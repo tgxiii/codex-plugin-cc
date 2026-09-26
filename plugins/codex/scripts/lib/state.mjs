@@ -83,6 +83,15 @@ function pruneJobs(jobs) {
     .slice(0, MAX_JOBS);
 }
 
+function summarizeJob(job) {
+  if (!job.request || typeof job.request !== "object" || !("prompt" in job.request)) {
+    return job;
+  }
+  const request = { ...job.request };
+  delete request.prompt;
+  return { ...job, request };
+}
+
 function removeFileIfExists(filePath) {
   if (filePath && fs.existsSync(filePath)) {
     fs.unlinkSync(filePath);
@@ -102,7 +111,7 @@ function writeJsonFile(filePath, value) {
 export function saveState(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
+  const nextJobs = pruneJobs(state.jobs ?? []).map(summarizeJob);
   const nextState = {
     version: STATE_VERSION,
     config: {

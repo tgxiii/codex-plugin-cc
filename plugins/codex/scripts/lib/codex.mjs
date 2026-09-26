@@ -96,6 +96,7 @@ function buildThreadParams(cwd, options = {}) {
   return {
     cwd,
     model: options.model ?? null,
+    ...(options.config ? { config: options.config } : {}),
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? "read-only",
     serviceName: SERVICE_NAME,
@@ -1236,6 +1237,7 @@ export async function runAppServerReview(cwd, options = {}) {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
+      ...(options.model ? { config: { review_model: options.model } } : {}),
       sandbox: "read-only",
       ephemeral: true,
       threadName: options.threadName
