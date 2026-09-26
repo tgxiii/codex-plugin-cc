@@ -1184,7 +1184,7 @@ test("subagent completion keeps the parent command on the active timeout", () =>
     ...buildEnv(binDir),
     CLAUDE_PLUGIN_DATA: "",
     CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "300",
-    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "2000"
+    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "10000"
   };
   const result = run("node", [SCRIPT, "task", "wait for the parent command"], { cwd: repo, env });
 
