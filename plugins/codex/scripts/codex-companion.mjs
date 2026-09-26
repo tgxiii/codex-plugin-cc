@@ -732,7 +732,7 @@ async function enqueueBackgroundTask(cwd, job, request) {
     storedRecord = readStoredJob(job.workspaceRoot, job.id);
   } catch (error) {
     if (!(error instanceof SyntaxError)) {
-      throw error;
+      appendLogLine(logFile, error instanceof Error ? error.message : String(error));
     }
     storedRecord = null;
   }

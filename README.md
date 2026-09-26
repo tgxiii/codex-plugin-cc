@@ -293,7 +293,7 @@ The plugin also supports these timeout environment variables. All values use mil
 - `CODEX_COMPANION_TURN_INTERRUPT_GRACE_MS` controls the terminal-event grace period after interrupt. The default is 5000.
 - `CODEX_COMPANION_BROKER_STREAM_LEASE_MS` controls the broker stream lease. The default is 3900000.
 
-The broker sets its lease floor from the environment of the companion that first starts it. That lease exceeds that companion's largest turn watchdog window by one minute. A later job with a larger active timeout can lose its broker connection when the original lease expires.
+The broker's idle stream lease is the greater of `CODEX_COMPANION_BROKER_STREAM_LEASE_MS` and the larger turn watchdog window plus 60 seconds, using the environment of the companion that first starts it. Stream traffic refreshes the lease, but a later job with a longer window can lose its connection if its stream stays silent beyond that lease.
 
 ### Moving The Work Over To Codex
 

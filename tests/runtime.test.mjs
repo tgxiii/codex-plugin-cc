@@ -1228,7 +1228,7 @@ test("non-retrying error drains its thread's active item and restores the short 
   });
 });
 
-test("turn/start can acknowledge after a delayed pre-ack heartbeat", () => {
+test("turn/start can acknowledge after 30 seconds when pre-ack events remain healthy", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "slow-turn-start-ack");
@@ -1240,7 +1240,7 @@ test("turn/start can acknowledge after a delayed pre-ack heartbeat", () => {
   const env = {
     ...buildEnv(binDir),
     CLAUDE_PLUGIN_DATA: "",
-    FAKE_CODEX_TURN_START_ACK_DELAY_MS: "800",
+    FAKE_CODEX_TURN_START_ACK_DELAY_MS: "30100",
     CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "200"
   };
   const result = run("node", [SCRIPT, "task", "wait for the healthy delayed acknowledgment"], { cwd: repo, env });
@@ -1514,6 +1514,10 @@ test("background timeout records timed_out and releases the broker stream owner"
   );
   assert.equal(timedOutJob.interruptAcknowledged, true);
   assert.equal(timedOutJob.timeoutWindowMs, 50);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.appServerStarts, 1);
+  assert.equal(fakeState.lastTurnStart.threadId, timedOutJob.threadId);
+  assert.equal(fakeState.lastTurnStart.turnId, timedOutJob.turnId);
   const brokerSession = JSON.parse(fs.readFileSync(path.join(stateDir, "broker.json"), "utf8"));
   assert.match(fs.readFileSync(brokerSession.logFile, "utf8"), /watchdog safety floor/);
   const brokerReply = await new Promise((resolve, reject) => {
