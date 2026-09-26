@@ -3,6 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
@@ -832,7 +833,7 @@ test("foreground task and review jobs store dispatched settings, and native revi
     cwd: repo,
     env: buildEnv(binDir)
   });
-  const review = run("node", [SCRIPT, "review", "--model", "gpt-6-astra"], {
+  const review = run("node", [SCRIPT, "review", "--model", "sol"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -861,10 +862,11 @@ test("foreground task and review jobs store dispatched settings, and native revi
     resumeLast: false,
     jobId: taskJob.id
   });
-  assert.deepEqual(reviewJob.request, { cwd: resolvedRepo, model: "gpt-6-astra", effort: null, base: null, scope: null });
+  assert.deepEqual(reviewJob.request, { cwd: resolvedRepo, model: "gpt-6-sol", effort: null, base: null, scope: null });
   assert.deepEqual(adversarialJob.request, { cwd: resolvedRepo, model: "gpt-6-sol", effort: "high", base: null, scope: null });
   const storedTask = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${taskJob.id}.json`), "utf8"));
   const storedReview = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${reviewJob.id}.json`), "utf8"));
+  assert.equal(storedReview.request.model, "gpt-6-sol");
   assert.equal(storedTask.request.model, "gpt-6-sol");
   assert.equal(storedReview.request.effort, null);
   const taskStatus = run("node", [SCRIPT, "status", taskJob.id, "--json"], { cwd: repo, env: buildEnv(binDir) });
@@ -875,6 +877,23 @@ test("foreground task and review jobs store dispatched settings, and native revi
   assert.equal(JSON.parse(reviewResult.stdout).storedJob.request.effort, null);
   const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.equal(fakeState.lastTurnStart.effort, "high");
+});
+
+test("native review resolves the sol alias before starting its thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "changed\n");
+
+  const result = run("node", [SCRIPT, "review", "--model", "sol"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(loadState(repo).jobs[0].request.model, "gpt-6-sol");
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastThreadStart.model, "gpt-6-sol");
 });
 
 test("task resolves the astra tier alias to its concrete model id", () => {
@@ -1009,6 +1028,22 @@ test("task logs subagent reasoning and messages with a subagent prefix", () => {
   );
 });
 
+test("acknowledged turn registers a known-parent subagent but ignores an unknown-parent subagent", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "with-foreign-subagent");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "check subagent ownership"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(result.status, 0, result.stderr);
+  const log = fs.readFileSync(loadState(repo).jobs[0].logFile, "utf8");
+  assert.match(log, /Subagent design-challenger reasoning:/);
+  assert.doesNotMatch(log, /Foreign thread message/);
+});
+
 test("task waits for the main thread to complete before returning the final result", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -1126,6 +1161,8 @@ test("task does not apply the idle timeout while a command item remains active",
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Handled the requested task/);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastInterrupt, null);
 
   run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
@@ -1191,7 +1228,7 @@ test("non-retrying error drains its thread's active item and restores the short 
   });
 });
 
-test("turn/start can acknowledge after 30 seconds when pre-ack events remain healthy", () => {
+test("turn/start can acknowledge after a delayed pre-ack heartbeat", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "slow-turn-start-ack");
@@ -1203,7 +1240,7 @@ test("turn/start can acknowledge after 30 seconds when pre-ack events remain hea
   const env = {
     ...buildEnv(binDir),
     CLAUDE_PLUGIN_DATA: "",
-    FAKE_CODEX_TURN_START_ACK_DELAY_MS: "30100",
+    FAKE_CODEX_TURN_START_ACK_DELAY_MS: "800",
     CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "200"
   };
   const result = run("node", [SCRIPT, "task", "wait for the healthy delayed acknowledgment"], { cwd: repo, env });
@@ -1479,10 +1516,23 @@ test("background timeout records timed_out and releases the broker stream owner"
   assert.equal(timedOutJob.timeoutWindowMs, 50);
   const brokerSession = JSON.parse(fs.readFileSync(path.join(stateDir, "broker.json"), "utf8"));
   assert.match(fs.readFileSync(brokerSession.logFile, "utf8"), /watchdog safety floor/);
-
-  const setup = run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env });
-  assert.equal(setup.status, 0, setup.stderr);
-  assert.equal(JSON.parse(setup.stdout).ready, true);
+  const brokerReply = await new Promise((resolve, reject) => {
+    const socket = createConnection(brokerSession.endpoint.slice("unix:".length));
+    let buffer = "";
+    socket.setEncoding("utf8");
+    socket.setTimeout(2000, () => socket.destroy(new Error("Broker probe timed out.")));
+    socket.on("error", reject);
+    socket.on("connect", () => socket.write(`${JSON.stringify({ id: 1, method: "thread/list", params: {} })}\n`));
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      if (buffer.includes("\n")) {
+        socket.end();
+        resolve(JSON.parse(buffer.split("\n", 1)[0]));
+      }
+    });
+  });
+  assert.equal(brokerReply.error, undefined, JSON.stringify(brokerReply));
+  assert.ok(brokerReply.result);
   await new Promise((resolve) => setTimeout(resolve, 100));
   assert.deepEqual(JSON.parse(fs.readFileSync(jobFile, "utf8")), timedOutJob);
 
@@ -1535,7 +1585,7 @@ test("interrupted completion after watchdog expiry records timed_out guidance", 
   });
 });
 
-test("background task records a pid-less spawn failure", () => {
+test("background task records the worker spawn error code", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -1548,7 +1598,7 @@ childProcess.spawn = function (file, args, options) {
   if (args?.includes("task-worker")) {
     const child = new EventEmitter();
     child.unref = () => {};
-    process.nextTick(() => child.emit("error", new Error("worker spawn failed")));
+    process.nextTick(() => child.emit("error", Object.assign(new Error("worker spawn failed"), { code: "EAGAIN" })));
     return child;
   }
   return originalSpawn(file, args, options);
@@ -1562,13 +1612,14 @@ require("node:module").syncBuiltinESMExports();
   });
 
   assert.equal(launched.status, 1);
-  assert.match(launched.stderr, /Failed to spawn background task worker \(no process ID\)/);
+  assert.match(launched.stderr, /Failed to spawn background task worker \(EAGAIN\)/);
   const [job] = loadState(repo).jobs;
   const stored = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${job.id}.json`), "utf8"));
   assert.equal(job.status, "failed");
-  assert.equal(job.errorMessage, "Failed to spawn background task worker (no process ID).");
+  assert.equal(job.errorMessage, "Failed to spawn background task worker (EAGAIN).");
   assert.equal(stored.status, "failed");
-  assert.equal(stored.errorMessage, "Failed to spawn background task worker (no process ID).");
+  assert.equal(stored.errorMessage, "Failed to spawn background task worker (EAGAIN).");
+  assert.match(fs.readFileSync(stored.logFile, "utf8"), /Failed to spawn background task worker \(EAGAIN\)/);
   assert.equal(stored.request.prompt, "inspect this change");
 });
 
@@ -1590,7 +1641,8 @@ childProcess.spawn = function (file, args, options) {
     let queuedWithRequest = false;
     try {
       const record = JSON.parse(fs.readFileSync(path.join(process.env.SPAWN_STATE_DIR, "jobs", jobId + ".json"), "utf8"));
-      queuedWithRequest = record.status === "queued" && record.request?.prompt === "inspect this change";
+      const state = JSON.parse(fs.readFileSync(path.join(process.env.SPAWN_STATE_DIR, "state.json"), "utf8"));
+      queuedWithRequest = record.status === "queued" && record.request?.prompt === "inspect this change" && state.jobs.some((job) => job.id === jobId && job.status === "queued");
     } catch {}
     fs.writeFileSync(process.env.SPAWN_MARKER, String(queuedWithRequest));
     const child = new EventEmitter();

@@ -126,6 +126,12 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.summary) {
     lines.push(`  Summary: ${job.summary}`);
   }
+  if (job.request?.model) {
+    lines.push(`  Model: ${job.request.model}`);
+  }
+  if (job.request?.effort) {
+    lines.push(`  Effort: ${job.request.effort}`);
+  }
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
   }
@@ -388,14 +394,20 @@ export function renderJobStatusReport(job) {
 }
 
 export function renderStoredJobResult(job, storedJob) {
+  const request = storedJob?.request ?? job.request;
+  const settings = [
+    request?.model ? `Model: ${request.model}` : null,
+    request?.effort ? `Effort: ${request.effort}` : null
+  ].filter(Boolean);
+  const withSettings = (output) => settings.length ? `${settings.join("\n")}\n\n${output}` : output;
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {
-      return output;
+      return withSettings(output);
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return withSettings(`${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`);
   }
 
   const rawOutput =
@@ -405,17 +417,17 @@ export function renderStoredJobResult(job, storedJob) {
   if (rawOutput) {
     const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
     if (!threadId) {
-      return output;
+      return withSettings(output);
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return withSettings(`${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`);
   }
 
   if (storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {
-      return output;
+      return withSettings(output);
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return withSettings(`${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`);
   }
 
   const lines = [
@@ -446,7 +458,7 @@ export function renderStoredJobResult(job, storedJob) {
     lines.push("", "No captured result payload was stored for this job.");
   }
 
-  return `${lines.join("\n").trimEnd()}\n`;
+  return withSettings(`${lines.join("\n").trimEnd()}\n`);
 }
 
 export function renderCancelReport(job) {

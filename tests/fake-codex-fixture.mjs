@@ -313,6 +313,8 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
+        state.lastThreadStart = { model: message.params.model ?? null };
+        saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
@@ -409,7 +411,7 @@ rl.on("line", (line) => {
         let reviewThread = thread;
         if (message.params.delivery === "detached") {
           reviewThread = nextThread(state, thread.cwd, true);
-          send({ method: "thread/started", params: { thread: { id: reviewThread.id } } });
+          send({ method: "thread/started", params: { thread: { id: reviewThread.id, parentThreadId: thread.id } } });
         }
         const turnId = nextTurnId(state);
         send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });
@@ -565,6 +567,7 @@ rl.on("line", (line) => {
 
         if (
           BEHAVIOR === "with-subagent" ||
+          BEHAVIOR === "with-foreign-subagent" ||
           BEHAVIOR === "with-late-subagent-message" ||
           BEHAVIOR === "with-subagent-no-main-turn-completed"
         ) {
@@ -574,7 +577,13 @@ rl.on("line", (line) => {
           saveState(state);
           const subTurnId = nextTurnId(state);
 
-          send({ method: "thread/started", params: { thread: { ...buildThread(subThreadRecord), name: "design-challenger", agentNickname: "design-challenger" } } });
+          send({ method: "thread/started", params: { thread: { ...buildThread(subThreadRecord), parentThreadId: thread.id, name: "design-challenger", agentNickname: "design-challenger" } } });
+          if (BEHAVIOR === "with-foreign-subagent") {
+            const foreignThread = nextThread(state, thread.cwd, true);
+            send({ method: "thread/started", params: { thread: { ...buildThread(foreignThread), parentThreadId: "unknown-parent", name: "foreign-agent" } } });
+            send({ method: "thread/name/updated", params: { threadId: foreignThread.id, threadName: "foreign-agent" } });
+            send({ method: "item/completed", params: { threadId: foreignThread.id, turnId: nextTurnId(state), item: { type: "agentMessage", id: "foreign-message", text: "Foreign thread message", phase: "analysis" } } });
+          }
           send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
           send({
             method: "item/started",

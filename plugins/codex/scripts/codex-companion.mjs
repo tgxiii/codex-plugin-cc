@@ -675,7 +675,7 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
-function spawnDetachedTaskWorker(cwd, jobId) {
+async function spawnDetachedTaskWorker(cwd, jobId) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
   const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
     cwd,
@@ -684,7 +684,12 @@ function spawnDetachedTaskWorker(cwd, jobId) {
     stdio: "ignore",
     windowsHide: true
   });
-  child.once("error", () => {});
+  let spawnError;
+  child.once("error", (error) => { spawnError = error; });
+  await new Promise((resolve) => setImmediate(resolve));
+  if (spawnError) {
+    throw new Error(`Failed to spawn background task worker (${spawnError.code ?? spawnError.message}).`);
+  }
   if (child.pid === undefined) {
     throw new Error("Failed to spawn background task worker (no process ID).");
   }
@@ -692,7 +697,7 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+async function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
@@ -709,8 +714,9 @@ function enqueueBackgroundTask(cwd, job, request) {
 
   let child;
   try {
-    child = spawnDetachedTaskWorker(cwd, job.id);
+    child = await spawnDetachedTaskWorker(cwd, job.id);
   } catch (error) {
+    appendLogLine(logFile, error instanceof Error ? error.message : String(error));
     const failedRecord = {
       ...queuedRecord,
       status: "failed",
@@ -724,7 +730,10 @@ function enqueueBackgroundTask(cwd, job, request) {
   let storedRecord;
   try {
     storedRecord = readStoredJob(job.workspaceRoot, job.id);
-  } catch {
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) {
+      throw error;
+    }
     storedRecord = null;
   }
   if (storedRecord?.status === "queued") {
@@ -759,6 +768,7 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const effort = config.reviewName === "Review" ? null : normalizeReasoningEffort(options.effort);
+  const model = normalizeRequestedModel(options.model);
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -777,7 +787,7 @@ async function handleReviewCommand(argv, config) {
   });
   job.request = {
     cwd,
-    model: options.model ?? null,
+    model,
     effort,
     base: options.base ?? null,
     scope: options.scope ?? null
@@ -789,7 +799,7 @@ async function handleReviewCommand(argv, config) {
         cwd,
         base: options.base,
         scope: options.scope,
-        model: options.model,
+        model,
         effort,
         focusText,
         reviewName: config.reviewName,
@@ -846,7 +856,7 @@ async function handleTask(argv) {
       resumeLast,
       jobId: job.id
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const { payload } = await enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
