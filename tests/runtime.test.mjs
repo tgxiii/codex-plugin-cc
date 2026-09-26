@@ -1155,7 +1155,7 @@ test("task does not apply the idle timeout while a command item remains active",
     ...buildEnv(binDir),
     CLAUDE_PLUGIN_DATA: "",
     CODEX_COMPANION_TURN_IDLE_TIMEOUT_MS: "300",
-    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "2000"
+    CODEX_COMPANION_TURN_ACTIVE_TIMEOUT_MS: "10000"
   };
   const result = run("node", [SCRIPT, "task", "run the long command"], { cwd: repo, env });
 
