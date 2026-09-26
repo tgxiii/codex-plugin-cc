@@ -687,17 +687,21 @@ function recordItem(state, item, lifecycle, threadId = null) {
 function applyTurnNotification(state, message) {
   switch (message.method) {
     case "thread/started":
-      registerThread(state, message.params.thread.id, {
-        threadName: message.params.thread.name,
-        name: message.params.thread.name,
-        agentNickname: message.params.thread.agentNickname,
-        agentRole: message.params.thread.agentRole
-      });
+      if (state.threadIds.has(message.params.thread.parentThreadId)) {
+        registerThread(state, message.params.thread.id, {
+          threadName: message.params.thread.name,
+          name: message.params.thread.name,
+          agentNickname: message.params.thread.agentNickname,
+          agentRole: message.params.thread.agentRole
+        });
+      }
       break;
     case "thread/name/updated":
-      registerThread(state, message.params.threadId, {
-        threadName: message.params.threadName ?? null
-      });
+      if (state.threadIds.has(message.params.threadId)) {
+        registerThread(state, message.params.threadId, {
+          threadName: message.params.threadName ?? null
+        });
+      }
       break;
     case "turn/started":
       registerThread(state, message.params.threadId);

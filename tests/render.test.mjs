@@ -1,7 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { renderJobStatusReport, renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+
+test("status and result show recorded model and effort only when present", () => {
+  const job = { id: "task-123", status: "completed", request: { model: "gpt-6-sol", effort: "high" } };
+  assert.match(renderJobStatusReport(job), /Model: gpt-6-sol\n  Effort: high/);
+  assert.match(renderStoredJobResult(job, { rendered: "Done.\n", request: job.request }), /Model: gpt-6-sol\nEffort: high/);
+  assert.doesNotMatch(renderJobStatusReport({ id: "task-456", status: "completed" }), /Model:|Effort:/);
+  assert.doesNotMatch(renderStoredJobResult({ id: "task-456", status: "completed" }, { rendered: "Done.\n" }), /Model:|Effort:/);
+});
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
