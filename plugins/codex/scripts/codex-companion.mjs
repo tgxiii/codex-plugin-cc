@@ -1065,6 +1065,7 @@ async function handleCancel(argv) {
   writeJobFile(workspaceRoot, job.id, {
     ...existing,
     ...nextJob,
+    ...(existing.request ? { request: existing.request } : {}),
     cancelledAt: completedAt
   });
   upsertJob(workspaceRoot, {
